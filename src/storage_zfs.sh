@@ -154,8 +154,15 @@ zfs::ensure_template() {
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         common::log INFO "Extracting squashfs filesystem into ZFS template..." NL
         [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
-        unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
-                   -user-xattrs -f -d "${mountpoint}" "${image}" >&2
+        if ! unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
+                        -user-xattrs -f -d "${mountpoint}" "${image}" >&2; then
+            common::log WARN "Extraction failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
+                       -user-xattrs -f -d "${mountpoint}" "${image}" >&2 \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Extraction failed even after evicting warm templates"; }
+        fi
         common::fixperms "${mountpoint}"
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
@@ -285,11 +292,15 @@ zfs::docker_install_from_layers() {
     elif zfs create -p "${tmp}" 2> /dev/null; then
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         mkdir -p rootfs
-        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root \
-                bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
-                         tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"; then
-            zfs destroy -r "${tmp}" 2> /dev/null || :
-            common::err "Failed to merge Docker layers into ZFS template"
+        local merge_cmd
+        merge_cmd="mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
+                   tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${merge_cmd}"; then
+            common::log WARN "Layer merge failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${merge_cmd}" \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Failed to merge Docker layers into ZFS template even after evicting warm templates"; }
         fi
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
