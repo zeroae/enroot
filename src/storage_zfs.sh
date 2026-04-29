@@ -311,6 +311,45 @@ zfs::recv_to_template_stdin() {
     zfs::clone_container "${template}" "${name}"
 }
 
+# Pulls a container from a remote enroot host over SSH. URI is zfs://host/NAME;
+# the SSH peer must be running enroot with the ZFS backend. Local NAME
+# defaults to the URI's basename if not given.
+zfs::pull_via_ssh() {
+    local -r uri="$1"
+    local name="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    zfs::parse_uri "${uri}" \
+      | { common::read -r host; common::read -r remote_name; }
+
+    [ -z "${name}" ] && name="${remote_name##*/}"
+
+    common::log INFO "Pulling ${remote_name} from ${host}" NL
+    ssh "${host}" enroot export --zfs-send "${remote_name}" \
+      | zfs::recv_to_template_stdin "${name}"
+}
+
+# Pushes a local container to a remote enroot host over SSH. URI may be
+# zfs://host (push under the same NAME) or zfs://host/REMOTE_NAME (rename on
+# the remote side).
+zfs::push_via_ssh() {
+    local -r name="$1" uri="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    if [[ "${uri}" =~ ^zfs://([^/]+)/?(.*)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        remote_name="${BASH_REMATCH[2]:-${name}}"
+    else
+        common::err "Invalid zfs:// URI: ${uri}"
+    fi
+
+    common::log INFO "Pushing ${name} to ${host} as ${remote_name}" NL
+    zfs::send_clone_stdout "${name}" \
+      | ssh "${host}" enroot import --zfs-recv -n "${remote_name}"
+}
+
 # Materializes a ZFS stream file into a template (cached by file sha) and
 # clones it as the user's named container. Counterpart of zfs::ensure_template
 # + zfs::clone_container for the .sqsh path; this is called from runtime::create
