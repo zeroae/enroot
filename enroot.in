@@ -170,9 +170,9 @@ enroot::usage() {
 		Create a container image from a container root filesystem.
 		
 		 Options:
-		   -o, --output  Name of the output image file (defaults to "NAME.sqsh" or "NAME.zfs")
+		   -o, --output  Output destination: a filename (defaults to "NAME.sqsh" or "NAME.zfs") or a "zfs://[USER@]HOST[/REMOTE_NAME]" URI to push to a remote enroot host over SSH
 		   -f, --force   Overwrite an existing container image
-		       --format  Output format: "sqsh" (default) or "zfs" (zfs send stream; requires ZFS backend)
+		       --format  Output format for file destinations: "sqsh" (default) or "zfs" (zfs send stream; requires ZFS backend)
 		EOF
         ;;
     import)
@@ -212,6 +212,7 @@ enroot::usage() {
 		
 		 Schemes:
 		   docker://[USER@][REGISTRY#]IMAGE[:TAG]  Load a Docker image from a registry
+		   zfs://[USER@]HOST/NAME                  Pull a container from a remote enroot host (full zfs send stream over SSH; both hosts must run the ZFS backend)
 
 		 Options:
 		   -a, --arch    Architecture of the image (defaults to host architecture)
