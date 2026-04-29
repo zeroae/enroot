@@ -70,7 +70,7 @@ When debugging container behavior, the order is: image `/etc/{rc,fstab,environme
 ## Active design proposals
 
 - **`doc/zfs.md`** — optional ZFS storage backend (`ENROOT_STORAGE_BACKEND=zfs`). Replaces `unsquashfs`-per-create with extract-once-then-`zfs clone`. Adds a `.zfs` (zfs send stream) image format and a `zfs://host/NAME` transport scheme alongside today's `.sqsh`. Introduces a shared template cache with a live/warm/cold lifecycle (knobs: `ENROOT_TEMPLATE_WARM_SECONDS`, `ENROOT_TEMPLATE_PRESSURE_THRESHOLD`; eviction is implicit on `create`, no daemon, no `enroot gc` command). Default backend (`dir`) is unchanged.
-- **`doc/plans/`** — six implementation plans (A–F) breaking the ZFS backend into independently-landable slices. Start with `doc/plans/README.md` for the index and recommended landing order (A → E → F → B → C → D). Plans add a new sourced module `src/storage_zfs.sh` (under a `zfs::` namespace) and branch in `src/runtime.sh`, `src/docker.sh` on `ENROOT_STORAGE_BACKEND`. **Plan A is implemented** on `feature/zfs-foundation` (PR [zeroae/enroot#1](https://github.com/zeroae/enroot/pull/1) → `zenroot/main`); B–F are still design-only.
+- **`doc/plans/`** — six implementation plans (A–F) breaking the ZFS backend into independently-landable slices. Start with `doc/plans/README.md` for the index and recommended landing order (A → E → F → B → C → D). Plans add a new sourced module `src/storage_zfs.sh` (under a `zfs::` namespace) and branch in `src/runtime.sh`, `src/docker.sh` on `ENROOT_STORAGE_BACKEND`. **Plan A is merged** on `zenroot/main` (PR [zeroae/enroot#1](https://github.com/zeroae/enroot/pull/1)); B–F are still design-only.
 
 ## Conventions
 
@@ -94,7 +94,7 @@ This working copy is a fork. Changes are **not destined for upstream merge** —
 **Branches:**
 - `main` — local mirror of `upstream/main`. Never commit here directly. Refresh with `git fetch upstream && git push origin upstream/main:main`.
 - `zenroot/main` — the **fork's default branch** and integration line. All feature work lands here. Periodically rebased onto `upstream/main` (see below).
-- `feature/<name>` — short-lived. Branch off `zenroot/main`, PR back into `zenroot/main`, delete after merge.
+- `feature/<name>` — branch off `zenroot/main`, PR back into `zenroot/main`. **Branches are kept after merge** (not deleted) so the per-plan history stays browsable on GitHub. Use the merge commit on `zenroot/main` as the canonical reference; the `feature/<name>` branch ref is a frozen pointer to the pre-merge state.
 
 **Opening a PR** (after pushing the feature branch):
 ```sh
