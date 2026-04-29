@@ -21,6 +21,11 @@
 # Enable native overlayfs support for "enroot load" and directly starting containers from SquashFS files.
 #ENROOT_NATIVE_OVERLAYFS yes
 
+# Storage backend for the container store. "dir" = today's plain directories (default).
+# "zfs" = use ZFS datasets; ENROOT_DATA_PATH must be a ZFS dataset mountpoint with
+# create/mount/clone/destroy/snapshot delegations granted to the user. See doc/zfs.md.
+#ENROOT_STORAGE_BACKEND     dir
+
 # Remap the current user to root inside containers by default.
 #ENROOT_REMAP_ROOT          no
 

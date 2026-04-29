@@ -100,6 +100,7 @@ config::export ENROOT_REMAP_ROOT       false
 config::export ENROOT_BUNDLE_ALL       false
 config::export ENROOT_BUNDLE_CHECKSUM  false
 config::export ENROOT_FORCE_OVERRIDE   false
+config::export ENROOT_STORAGE_BACKEND  "dir"
 
 config::fini
 
@@ -112,6 +113,7 @@ export ENROOT_VERSION="@version@"
 source "${ENROOT_LIBRARY_PATH}/common.sh"
 source "${ENROOT_LIBRARY_PATH}/docker.sh"
 source "${ENROOT_LIBRARY_PATH}/runtime.sh"
+source "${ENROOT_LIBRARY_PATH}/storage_zfs.sh"
 
 enroot::usage() {
     case "$1" in

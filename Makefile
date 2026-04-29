@@ -26,10 +26,11 @@ EMAIL    := cudatools@nvidia.com
 
 BIN := enroot
 
-SRCS := src/common.sh  \
-        src/bundle.sh  \
-        src/docker.sh  \
-        src/runtime.sh
+SRCS := src/common.sh      \
+        src/bundle.sh      \
+        src/docker.sh      \
+        src/runtime.sh     \
+        src/storage_zfs.sh
 
 DEPS := deps/dist/makeself/bin/enroot-makeself \
 
