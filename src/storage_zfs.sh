@@ -137,6 +137,108 @@ zfs::image_sha256() {
     sha256sum "${image}" | awk '{print $1}'
 }
 
+# Pointer file format: a small plain-text artifact written by
+# enroot import docker://... when the ZFS backend is active. It carries
+# the stable image-config-sha256 (the cache key used by
+# zfs::_install_template_from_layers) plus enough metadata to recover from
+# template eviction by re-pulling from the registry. Filename stays .sqsh
+# so pyxis (which feeds the path back to enroot create unchanged) is
+# unaware of the format change. enroot create magic-byte-sniffs the first
+# 19 bytes (`enroot-zfs-image:v1`) and dispatches to the pointer path.
+readonly zfs_pointer_magic="enroot-zfs-image:v1"
+
+# Returns 0 if the ZFS backend is active AND ENROOT_ZFS_IMPORT_FORMAT is
+# unset or set to "pointer". Returns 1 otherwise (e.g. "squashfs" opt-out
+# or dir backend). Callers gate the new pointer-import path on this.
+zfs::pointer_format_active() {
+    zfs::enabled || return 1
+    case "${ENROOT_ZFS_IMPORT_FORMAT-pointer}" in
+        pointer) return 0 ;;
+        squashfs) return 1 ;;
+        *) common::err "Invalid ENROOT_ZFS_IMPORT_FORMAT: ${ENROOT_ZFS_IMPORT_FORMAT} (expected pointer or squashfs)" ;;
+    esac
+}
+
+# Returns 0 iff the file at $1 starts with the pointer magic line. Reads
+# only the first 19 bytes; never reads beyond. Safe on regular files,
+# squashfs blobs, ZFS send streams, and short/empty files.
+zfs::is_pointer() {
+    local -r path="$1"
+    local head
+    [ -f "${path}" ] || return 1
+    head=$(dd if="${path}" bs=19 count=1 2> /dev/null) || return 1
+    [ "${head}" = "${zfs_pointer_magic}" ]
+}
+
+# Atomically writes a pointer file at $1 with the given fields. Uses
+# tmp + rename so partial writes never leave a half-formed pointer behind.
+# All inputs are validated; refuses to write a pointer with a malformed
+# config_sha or manifest_digest.
+zfs::write_pointer() {
+    local -r output="$1" config_sha="$2" manifest_digest="$3" arch="$4" uri="$5"
+    local tmp imported
+
+    [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
+      || common::err "zfs::write_pointer: invalid image-config-sha256: ${config_sha}"
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    [[ "${uri}" =~ ^docker:// ]] \
+      || common::err "zfs::write_pointer: uri must start with docker://: ${uri}"
+
+    imported=$(date -u +%FT%TZ)
+    tmp="${output}.tmp.$$"
+    {
+        printf "%s\n" "${zfs_pointer_magic}"
+        printf "image-config-sha256=%s\n" "${config_sha}"
+        printf "manifest-digest=%s\n" "${manifest_digest}"
+        printf "arch=%s\n" "${arch}"
+        printf "uri=%s\n" "${uri}"
+        printf "imported=%s\n" "${imported}"
+    } > "${tmp}" || { rm -f "${tmp}" 2> /dev/null || :; common::err "Failed to write pointer ${output}"; }
+    mv -f "${tmp}" "${output}"
+}
+
+# Parses a pointer file and prints the recognized fields, one per line, as
+# KEY=VALUE pairs (suitable for `eval`-style consumption — the values
+# themselves are validated against strict regexes so no shell-metachar
+# escape is needed). Errors if the magic line is missing or any required
+# field fails validation.
+zfs::read_pointer() {
+    local -r path="$1"
+    local line key value config_sha= manifest_digest= arch= uri= imported=
+
+    common::read -r line < "${path}"
+    [ "${line}" = "${zfs_pointer_magic}" ] \
+      || common::err "Not a ZFS pointer file: ${path}"
+
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            image-config-sha256) config_sha="${value}" ;;
+            manifest-digest)     manifest_digest="${value}" ;;
+            arch)                arch="${value}" ;;
+            uri)                 uri="${value}" ;;
+            imported)            imported="${value}" ;;
+            "")                  : ;;  # blank line
+            *) : ;;                    # forward-compatible: ignore unknown
+        esac
+    done < <(tail -n +2 "${path}")
+
+    [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
+      || common::err "Pointer ${path} missing/invalid image-config-sha256"
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "Pointer ${path} missing/invalid manifest-digest"
+    [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
+      || common::err "Pointer ${path} missing/invalid arch"
+    [[ "${uri}" =~ ^docker:// ]] \
+      || common::err "Pointer ${path} missing/invalid uri"
+
+    printf "image-config-sha256=%s\n" "${config_sha}"
+    printf "manifest-digest=%s\n"     "${manifest_digest}"
+    printf "arch=%s\n"                "${arch}"
+    printf "uri=%s\n"                 "${uri}"
+    printf "imported=%s\n"            "${imported}"
+}
+
 # Ensures a template dataset exists for the given image hash, extracting if needed.
 # Prints the template's full dataset name (e.g. tank/enroot/.templates/<sha>).
 # Atomic across concurrent callers via a per-hash .tmp dataset.
