@@ -218,7 +218,11 @@ zfs::clone_container() {
         zfs destroy -r "${target}"
     fi
 
-    zfs clone -u "${template}@${zfs_pristine_snap}" "${target}"
+    # canmount=noauto skips the auto-mount on create (works on OpenZFS 2.0+).
+    # `zfs clone -u` would do the same but is only in 2.3+; `-o canmount=noauto`
+    # is the portable equivalent. The helper's mount(2) call below is unaffected
+    # by canmount (it bypasses ZFS's own mount machinery).
+    zfs clone -o canmount=noauto "${template}@${zfs_pristine_snap}" "${target}"
     if ! enroot-zfs-mount "${target}" 2> /dev/null; then
         zfs destroy "${target}" 2> /dev/null || :
         common::err "failed to mount cloned container ${name}"
@@ -258,7 +262,9 @@ zfs::ephemeral_clone() {
     clone="${store}/${zfs_ephemeral_subdir}/${$}-${sha:0:12}"
     zfs create -u "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
     enroot-zfs-mount "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
-    zfs clone -u "${template}@${zfs_pristine_snap}" "${clone}"
+    # canmount=noauto skips the auto-mount on clone (portable across OpenZFS
+    # 2.0+; `zfs clone -u` would do the same but is only in 2.3+).
+    zfs clone -o canmount=noauto "${template}@${zfs_pristine_snap}" "${clone}"
     zfs set readonly=off "${clone}"
     if ! enroot-zfs-mount "${clone}" 2> /dev/null; then
         zfs destroy "${clone}" 2> /dev/null || :

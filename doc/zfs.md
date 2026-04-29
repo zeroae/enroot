@@ -193,11 +193,11 @@ A site enabling the ZFS backend should:
 3. **Delegate ZFS permissions** to unprivileged users so they can create, clone, and destroy datasets in their own namespace, and receive into the templates cache:
 
    ```sh
-   zfs allow user create,mount,clone,destroy,snapshot,rename tank/enroot
+   zfs allow user create,mount,clone,destroy,snapshot,rename,canmount,userprop tank/enroot
    zfs allow user receive tank/enroot/templates
    ```
 
-   `zfs receive` from `.zfs` files and `zfs://` requires this delegation. Without it, the ZFS backend operates only on already-received templates.
+   `zfs receive` from `.zfs` files and `zfs://` requires this delegation. Without it, the ZFS backend operates only on already-received templates. The `canmount` permission is needed for `zfs clone -o canmount=noauto` (the portable equivalent of `zfs clone -u`, which is OpenZFS 2.3+ only). The `userprop` permission is needed for `enroot:last_used` (the warm/cold lifecycle's per-template timestamp); without it, sweep behavior degrades but `create` / `remove` still work.
 
    **Linux mount(2) bypass via `enroot-zfs-mount`:** ZFS delegation governs
    ZFS's *internal* logic, but on Linux the kernel `mount(2)` syscall still
