@@ -18,6 +18,7 @@ source "${ENROOT_LIBRARY_PATH}/common.sh"
 
 readonly zfs_template_subdir=".templates"
 readonly zfs_pristine_snap="pristine"
+readonly zfs_ephemeral_subdir=".ephemeral"
 
 # Returns 0 if the ZFS storage backend is configured, 1 otherwise.
 zfs::enabled() {
@@ -132,4 +133,33 @@ zfs::destroy_container() {
         zfs destroy "${origin}" 2> /dev/null && \
             zfs destroy "${template}" 2> /dev/null || :
     fi
+}
+
+# Creates an ephemeral clone of the template for the given image and prints its
+# clone dataset name and mountpoint (tab-separated). The clone name embeds the
+# host PID for uniqueness so concurrent enroot processes don't collide and so
+# the cleanup hook can find the right clone. Intended to be torn down via
+# zfs::ephemeral_destroy when the enroot process exits.
+zfs::ephemeral_clone() {
+    local -r image="$1"
+    local -r store=$(zfs::store_dataset)
+    local sha template clone mountpoint
+
+    sha=$(zfs::image_sha256 "${image}")
+    template=$(zfs::ensure_template "${image}" "${sha}")
+
+    clone="${store}/${zfs_ephemeral_subdir}/${$}-${sha:0:12}"
+    zfs create -p "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
+    zfs clone "${template}@${zfs_pristine_snap}" "${clone}"
+    zfs set readonly=off "${clone}"
+
+    mountpoint=$(zfs get -H -o value mountpoint "${clone}")
+    printf "%s\t%s" "${clone}" "${mountpoint}"
+}
+
+# Destroys an ephemeral clone. Best-effort; intended for cleanup hooks.
+zfs::ephemeral_destroy() {
+    local -r clone="$1"
+    [ -z "${clone}" ] && return
+    zfs destroy "${clone}" 2> /dev/null || :
 }
