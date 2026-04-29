@@ -13,6 +13,7 @@
 # limitations under the License.
 
 source "${ENROOT_LIBRARY_PATH}/common.sh"
+source "${ENROOT_LIBRARY_PATH}/storage_zfs.sh"
 
 readonly hook_dirs=("${ENROOT_SYSCONF_PATH}/hooks.d" "${ENROOT_CONFIG_PATH}/hooks.d")
 readonly mount_dirs=("${ENROOT_SYSCONF_PATH}/mounts.d" "${ENROOT_CONFIG_PATH}/mounts.d")
@@ -175,11 +176,6 @@ runtime::_mount_rootfs() {
     local -r image="$1" rootfs="$2"
     local pid=0 rv=0
 
-    if zfs::enabled; then
-        runtime::_mount_rootfs_zfs "${image}" "${rootfs}"
-        return
-    fi
-
     common::checkcmd squashfuse mountpoint
     if [ -z "${ENROOT_NATIVE_OVERLAYFS-}" ]; then
         common::checkcmd fuse-overlayfs
@@ -213,27 +209,6 @@ runtime::_mount_rootfs() {
     fi
     exec {fd}>&-
     disown "${pid}" > /dev/null 2>&1
-}
-
-runtime::_mount_rootfs_zfs() {
-    local -r image="$1" rootfs="$2"
-    local out clone mountpoint
-
-    zfs::checkenv
-
-    out=$(zfs::ephemeral_clone "${image}")
-    clone="${out%%$'\t'*}"
-    mountpoint="${out##*$'\t'}"
-
-    # Bind-mount the ephemeral clone's mountpoint over the placeholder rootfs
-    # path the caller already prepared, so the rest of runtime::_start operates
-    # on it identically to the squashfuse+overlay path.
-    cat <<- EOF | enroot-mount -
-	${mountpoint} ${rootfs} none rbind
-	EOF
-
-    # Stash the clone name so runtime::_start's cleanup trap can destroy it on exit.
-    printf "%s\n" "${clone}" > "${ENROOT_RUNTIME_PATH}/zfs_ephemeral"
 }
 
 runtime::_start() {
@@ -375,11 +350,34 @@ runtime::start() {
         unpriv=y
     fi
 
+    # ZFS backend: when starting from an image file, clone the template into an
+    # ephemeral dataset BEFORE entering the user namespace (zfs(8) cannot
+    # enumerate datasets from inside a userns), and arrange to destroy it on
+    # exit. The container then sees the clone's mountpoint as a directory rootfs
+    # and the rest of runtime::_start operates on it normally.
+    if zfs::enabled && [ -f "${rootfs}" ]; then
+        local _zfs_ephemeral_out _zfs_ephemeral_clone _zfs_ephemeral_mountpoint
+        _zfs_ephemeral_out=$(zfs::ephemeral_clone "${rootfs}")
+        _zfs_ephemeral_clone="${_zfs_ephemeral_out%%$'\t'*}"
+        _zfs_ephemeral_mountpoint="${_zfs_ephemeral_out##*$'\t'}"
+        # Embed the clone name in the trap body so the value survives
+        # local-variable scope when the script exits.
+        trap "zfs::ephemeral_destroy '${_zfs_ephemeral_clone}'" EXIT
+        rootfs="${_zfs_ephemeral_mountpoint}"
+    fi
+
     # Create new namespaces and start the container.
     export BASH_ENV="${BASH_SOURCE[0]}"
-    exec enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
-      "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
-      'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
+    if [ -n "${_zfs_ephemeral_clone-}" ]; then
+        # Don't exec: we need our shell to live so the EXIT trap above fires.
+        enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
+          "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
+          'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
+    else
+        exec enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
+          "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
+          'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
+    fi
 }
 
 runtime::exec() {
