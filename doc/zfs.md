@@ -1,6 +1,6 @@
 # ZFS storage backend
 
-This document describes an optional ZFS-aware mode for the enroot container store. **Plans A (foundation), E (ephemeral start), and F (Docker load) are implemented**: `enroot create`, `enroot remove`, ephemeral `enroot start <image>`, and `enroot load docker://...` all use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
+This document describes an optional ZFS-aware mode for the enroot container store. **Plans A (foundation), B (template warm/cold lifecycle), E (ephemeral start), and F (Docker load) are implemented**: `enroot create`, `enroot remove`, ephemeral `enroot start <image>`, and `enroot load docker://...` all use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`, with a shared template cache that survives `enroot remove` (warm) for `ENROOT_TEMPLATE_WARM_SECONDS` and gets pressure-evicted LRU once the templates dataset crosses `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` of its quota. The remaining transports (`.zfs` file format, `zfs://` URI) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
 
 ## Motivation
 
