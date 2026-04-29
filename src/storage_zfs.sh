@@ -91,3 +91,20 @@ zfs::ensure_template() {
     common::err "Timed out waiting for template extraction: ${template}. \
 A previous extractor may have crashed; remove ${tmp} manually and retry."
 }
+
+# Clones the @pristine snapshot of a template into a named user container.
+# Errors if the target name is already taken.
+zfs::clone_container() {
+    local -r template="$1" name="$2"
+    local -r store=$(zfs::store_dataset)
+    local -r target="${store}/${name}"
+
+    if zfs list -H "${target}" > /dev/null 2>&1; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "Container already exists: ${name}"
+        fi
+        zfs destroy -r "${target}"
+    fi
+
+    zfs clone "${template}@${zfs_pristine_snap}" "${target}"
+}
