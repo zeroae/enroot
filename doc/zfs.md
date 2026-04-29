@@ -206,7 +206,7 @@ A site enabling the ZFS backend should:
 
    On hosts where the same operator runs `create` and `start`, the privileged-create approach is simpler and matches enroot's existing model where image conversion (`enroot import`/`enroot-aufs2ovlfs`) already requires elevated privileges.
 
-   **Linux user-namespace caveat:** `zfs list` cannot enumerate datasets from inside a Linux user namespace — even when their mount entries are visible — so any ZFS work must happen *before* `enroot-nsenter --user`. For ephemeral `enroot start <image>` (Plan E), the ephemeral clone is created in `runtime::start` outside the namespace, with a shell trap that destroys it on the parent process's exit. Implementation-internal, but worth knowing if you debug.
+   **Linux user-namespace caveat:** `zfs list` cannot enumerate datasets from inside a Linux user namespace — even when their mount entries are visible — so any ZFS work must happen *before* `enroot-nsenter --user`. For ephemeral `enroot start <image>` (Plan E), the ephemeral clone is created in `runtime::start` outside the namespace; cleanup is handled by a small "zfs-eph-shim" subshell that mirrors the existing `runtime::_mount_rootfs_shim` pattern — forked into its own process group, parked with `SIGSTOP`, and triggered to `zfs destroy` via the kernel's orphaned-process-group `SIGHUP` rule when the container's exec chain exits. The original `exec enroot-nsenter ...` chain is preserved, so PID semantics, signal forwarding, and `enroot exec PID` all work identically to the `dir` backend.
 
 4. **Configure `ENROOT_STORAGE_BACKEND=zfs`** in `enroot.conf` (or per-user). Set `ENROOT_DATA_PATH` to the mountpoint of `tank/enroot` (or per-user subdataset).
 

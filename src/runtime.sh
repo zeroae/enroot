@@ -352,32 +352,46 @@ runtime::start() {
 
     # ZFS backend: when starting from an image file, clone the template into an
     # ephemeral dataset BEFORE entering the user namespace (zfs(8) cannot
-    # enumerate datasets from inside a userns), and arrange to destroy it on
-    # exit. The container then sees the clone's mountpoint as a directory rootfs
-    # and the rest of runtime::_start operates on it normally.
+    # enumerate datasets from inside a userns) and fork a shim into its own
+    # process group to destroy the clone when the container exits. The shim
+    # mirrors runtime::_mount_rootfs_shim's orphaned-process-group cleanup
+    # pattern: it parks itself with SIGSTOP, gets SIGHUP'd by the kernel once
+    # this shell's exec'd container chain exits, and then runs zfs destroy.
     if zfs::enabled && [ -f "${rootfs}" ]; then
-        local _zfs_ephemeral_out _zfs_ephemeral_clone _zfs_ephemeral_mountpoint
-        _zfs_ephemeral_out=$(zfs::ephemeral_clone "${rootfs}")
-        _zfs_ephemeral_clone="${_zfs_ephemeral_out%%$'\t'*}"
-        _zfs_ephemeral_mountpoint="${_zfs_ephemeral_out##*$'\t'}"
-        # Embed the clone name in the trap body so the value survives
-        # local-variable scope when the script exits.
-        trap "zfs::ephemeral_destroy '${_zfs_ephemeral_clone}'" EXIT
-        rootfs="${_zfs_ephemeral_mountpoint}"
+        local _zfs_eph_out _zfs_eph_clone _zfs_eph_mountpoint _zfs_eph_pid _zfs_eph_rv=0
+        _zfs_eph_out=$(zfs::ephemeral_clone "${rootfs}")
+        _zfs_eph_clone="${_zfs_eph_out%%$'\t'*}"
+        _zfs_eph_mountpoint="${_zfs_eph_out##*$'\t'}"
+
+        set -m
+        (
+            exec -a zfs-eph-shim "${BASH}" <<- EOF
+		$(declare -f zfs::ephemeral_destroy common::log common::fmt)
+		runtime::_zfs_ephemeral_shim() {
+		    trap "zfs::ephemeral_destroy '${_zfs_eph_clone}'; exit 0" SIGHUP
+		    kill -STOP \$\$
+		}
+		runtime::_zfs_ephemeral_shim
+		EOF
+        ) > /dev/null 2>&1 & _zfs_eph_pid=$!
+
+        # Wait for the shim to park itself (exit code 128+SIGSTOP=147).
+        wait "${_zfs_eph_pid}" 2> /dev/null || _zfs_eph_rv=$?
+        set +m
+        if ((_zfs_eph_rv != 128 + 19)); then
+            zfs::ephemeral_destroy "${_zfs_eph_clone}"
+            common::err "ZFS ephemeral cleanup shim failed to start (rv=${_zfs_eph_rv})"
+        fi
+        disown "${_zfs_eph_pid}" > /dev/null 2>&1
+
+        rootfs="${_zfs_eph_mountpoint}"
     fi
 
     # Create new namespaces and start the container.
     export BASH_ENV="${BASH_SOURCE[0]}"
-    if [ -n "${_zfs_ephemeral_clone-}" ]; then
-        # Don't exec: we need our shell to live so the EXIT trap above fires.
-        enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
-          "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
-          'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
-    else
-        exec enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
-          "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
-          'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
-    fi
+    exec enroot-nsenter ${unpriv:+--user} --mount ${ENROOT_REMAP_ROOT:+--remap-root} \
+      "${BASH}" --norc -o ${SHELLOPTS//:/ -o } -O ${BASHOPTS//:/ -O } -c \
+      'runtime::_start "$@"' "${config}" "${rootfs}" "${rc}" "${config}" "${mounts}" "${environ}" "$@"
 }
 
 runtime::exec() {
