@@ -451,11 +451,19 @@ Append at the end of `src/storage_zfs.sh`:
 # Inputs:
 #   $1 uri          - docker://[USER@]REGISTRY[:PORT]/IMAGE[:TAG]
 #   $2 output_path  - where to write the pointer (caller pre-validated)
-#   $3 arch         - already debarch-normalized
-zfs::import_docker_pointer() {
-    local -r uri="$1" output_path="$2" arch="$3"
+#   $3 arch         - raw uname -m form (e.g. "aarch64"); normalized internally
+#                     via common::debarch, same convention as docker::import /
+#                     docker::load. Empty means "skip arch validation".
+#
+# Subshell function (parens) so cwd and EXIT trap stay scoped to this call —
+# matches docker::import / docker::load.
+zfs::import_docker_pointer() (
+    local -r uri="$1" output_path="$2"
+    local arch="$3"
     local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
     local manifest_digest=
+
+    set -euo pipefail
 
     common::checkcmd curl grep awk jq parallel tar "${ENROOT_GZIP_PROGRAM}" find zstd
 
@@ -463,11 +471,19 @@ zfs::import_docker_pointer() {
       | { common::read -r user; common::read -r registry; common::read -r image; common::read -r tag; }
 
     # Fetch the manifest digest first (cheap HEAD on the manifest URL).
-    # We do this before the expensive layer pull so a registry-side
-    # mismatch fails fast.
+    # Done before the expensive layer pull so a registry-side mismatch
+    # fails fast. docker::digest takes raw arch ($3) and normalizes
+    # internally — pass it the unmodified caller-supplied arch.
     manifest_digest=$(docker::digest "${uri}" "${arch}")
     [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
       || common::err "registry returned invalid manifest digest: ${manifest_digest}"
+
+    # Convert the architecture to the debian format for the internal
+    # helpers (docker::_prepare_layers, our own pointer file). Same
+    # convention as docker::import / docker::load.
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
 
     # Create a temporary directory and chdir to it (same pattern as
     # docker::import / docker::load — _prepare_layers writes layer
@@ -489,7 +505,7 @@ zfs::import_docker_pointer() {
     zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
 
     zfs::write_pointer "${output_path}" "${config}" "${manifest_digest}" "${arch}" "${uri}"
-}
+)
 ```
 
 - [ ] **Step 3: Syntax-check**
@@ -562,11 +578,13 @@ Append at the end of `src/storage_zfs.sh`:
 #   $1 pointer_path  - validated pointer file (caller already passed
 #                      zfs::is_pointer)
 #   $2 name          - user-visible container name (no slashes)
-zfs::create_from_pointer() {
+zfs::create_from_pointer() (
     local -r pointer_path="$1" name="$2"
     local fresh_config_sha
     local image_config_sha256= manifest_digest= arch= uri= imported=
     local store template
+
+    set -euo pipefail
 
     zfs::checkenv
 
@@ -587,6 +605,9 @@ zfs::create_from_pointer() {
     # the upstream tag has been republished, which we surface as a clear
     # error rather than silently cloning a different image.
     common::log INFO "Template ${image_config_sha256:0:12} evicted; re-pulling from ${uri}"
+    # The pointer's `arch` is already debian-normalized (write_pointer
+    # was given the normalized form), so pass it straight through to the
+    # puller, which expects normalized.
     fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
     if [ "${fresh_config_sha}" != "${image_config_sha256}" ]; then
         common::err "Pointer ${pointer_path} references image-config-sha256 ${image_config_sha256:0:12}, but ${uri} now resolves to ${fresh_config_sha:0:12}. Delete and re-import."
@@ -595,15 +616,26 @@ zfs::create_from_pointer() {
     store=$(zfs::store_dataset)
     template="${store}/${zfs_template_subdir}/${image_config_sha256}"
     zfs::clone_container "${template}" "${name}"
-}
+)
 
 # Internal helper used by both the import flow's recovery path and (via
 # zfs::import_docker_pointer) the main import flow. Pulls layers and
 # installs the template; prints the resolved image-config-sha256 so the
 # caller can validate it. Does NOT write a pointer file.
-zfs::_pull_and_install_template() {
+#
+# Inputs:
+#   $1 uri    - docker:// URI
+#   $2 arch   - ALREADY debarch-normalized (callers must convert with
+#               common::debarch first, or pass through the value already
+#               stored in a pointer file).
+#
+# Subshell function for cwd / EXIT trap scoping (see import_docker_pointer
+# for the same rationale).
+zfs::_pull_and_install_template() (
     local -r uri="$1" arch="$2"
     local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
+
+    set -euo pipefail
 
     common::checkcmd curl grep awk jq parallel tar "${ENROOT_GZIP_PROGRAM}" find zstd
 
@@ -624,21 +656,32 @@ zfs::_pull_and_install_template() {
     zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
 
     printf "%s" "${config}"
-}
+)
 ```
 
 - [ ] **Step 2: Refactor `zfs::import_docker_pointer` to share the puller**
 
-Now that `zfs::_pull_and_install_template` exists, dedupe `zfs::import_docker_pointer` to use it. Replace the body of `zfs::import_docker_pointer` (everything between `zfs::import_docker_pointer() {` and the matching `}`) with:
+Now that `zfs::_pull_and_install_template` exists, dedupe `zfs::import_docker_pointer` to use it. Replace the body of `zfs::import_docker_pointer` (everything between `zfs::import_docker_pointer() (` and the matching `)`) with:
 
 ```bash
-    local -r uri="$1" output_path="$2" arch="$3"
+    local -r uri="$1" output_path="$2"
+    local arch="$3"
     local config_sha= manifest_digest=
 
-    # Fetch the manifest digest first (cheap HEAD; fails fast on bad URI).
+    set -euo pipefail
+
+    # Fetch the manifest digest first (cheap HEAD on the manifest URL).
+    # docker::digest takes raw arch and normalizes internally — pass it
+    # the unmodified caller-supplied arch.
     manifest_digest=$(docker::digest "${uri}" "${arch}")
     [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
       || common::err "registry returned invalid manifest digest: ${manifest_digest}"
+
+    # Convert the architecture to the debian format for the internal
+    # helpers. _pull_and_install_template expects already-normalized arch.
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
 
     config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
 
@@ -803,24 +846,23 @@ runtime::import() {
             # Filename defaulting follows docker::import (caller may
             # leave $filename empty); we still produce a .sqsh-named
             # file so pyxis hands it back to enroot create unchanged.
+            #
+            # Arch is passed RAW (uname -m form) to zfs::import_docker_pointer;
+            # that function normalizes via common::debarch internally — same
+            # convention as docker::import / docker::load, which is critical
+            # because common::debarch only accepts raw forms.
             if [ -z "${filename}" ]; then
                 # Mirror docker::import's filename derivation. Re-parse
-                # the URI here to compute the default name.
+                # the URI here to compute the default name. Filename
+                # derivation does not depend on arch.
                 local _user= _registry= _image= _tag=
                 docker::_parse_uri "${uri}" \
                   | { common::read -r _user; common::read -r _registry; common::read -r _image; common::read -r _tag; }
-                if [ -n "${arch}" ]; then
-                    arch=$(common::debarch "${arch}")
-                fi
                 local _display_image="${_image}"
                 if [[ "${_registry}" == "registry-1.docker.io" && "${_image}" == library/* ]]; then
                     _display_image="${_image#library/}"
                 fi
                 filename="${_display_image////+}${_tag:++${_tag}}.sqsh"
-            else
-                if [ -n "${arch}" ]; then
-                    arch=$(common::debarch "${arch}")
-                fi
             fi
             filename=$(common::realpath "${filename}")
             if [ -e "${filename}" ]; then
