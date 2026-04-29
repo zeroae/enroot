@@ -571,21 +571,20 @@ zfs::send_stream() {
 }
 
 # Materializes the merged Docker rootfs into a ZFS template (cached by
-# cache_key) and clones it as the user's named container. Designed to be
-# called from docker::load AFTER docker::_prepare_layers has populated the
-# cwd with extracted, whiteout-converted layer directories 0/, 1/, ..., N/.
+# cache_key). Designed to be called from docker::load (or the pointer-import
+# flow) AFTER docker::_prepare_layers has populated the cwd with extracted,
+# whiteout-converted layer directories 0/, 1/, ..., N/.
 #
 # Inputs:
 #   $1 cache_key   - sha256 of the image config blob (a stable per-image key)
 #   $2 layer_count - the N from _prepare_layers (count of layer directories)
 #   $3 unpriv      - "y" or "" — whether to enter a new user namespace
-#   $4 name        - the user-visible container name (no slashes)
 #
 # Atomicity: races on the same cache_key are resolved via a per-key .tmp
 # dataset lock; losers wait for @pristine. ENOSPC mid-merge destroys the
 # .tmp so a retry can run.
-zfs::docker_install_from_layers() {
-    local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+zfs::_install_template_from_layers() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3"
     local store template tmp snap mountpoint i=0
     store=$(zfs::store_dataset)
     template="${store}/${zfs_template_subdir}/${cache_key}"
@@ -632,5 +631,15 @@ zfs::docker_install_from_layers() {
         done
     fi
 
+    printf "%s" "${template}"
+}
+
+# Backwards-compatible wrapper: install the template (or wait for one) and
+# clone it into the user-visible container name. This is what existing callers
+# (docker::load) use.
+zfs::docker_install_from_layers() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+    local template
+    template=$(zfs::_install_template_from_layers "${cache_key}" "${layer_count}" "${unpriv}")
     zfs::clone_container "${template}" "${name}"
 }
