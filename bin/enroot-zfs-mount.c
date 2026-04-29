@@ -84,15 +84,59 @@ resolve_parent_dataset(const char *data_path)
         return (best_src);
 }
 
-/* Returns true iff dataset is exactly parent or a child path under parent/. */
-static bool
-dataset_under(const char *dataset, const char *parent)
-{
-        size_t pl = strlen(parent);
 
-        if (strncmp(dataset, parent, pl) != 0)
+/*
+ * Returns the ZFS `mountpoint` property of `dataset` (malloc'd absolute path),
+ * or NULL on error / non-path values (e.g. "none", "legacy", "-"). Exec's
+ * `zfs get -H -o value mountpoint DATASET` via popen.
+ */
+static char *
+get_mountpoint(const char *dataset)
+{
+        char cmd[PATH_MAX + 64];
+        FILE *p;
+        char buf[PATH_MAX];
+        char *result = NULL;
+
+        /* dataset is single-quote-wrapped in the shell. ZFS dataset names
+         * cannot contain single quotes (per the ZFS naming rules — only
+         * alphanumerics, period, underscore, dash, colon, and slash), so
+         * shell-injection via the dataset arg is not possible here. The
+         * dataset has already been prefix-validated by path_under(). */
+        int n = snprintf(cmd, sizeof(cmd),
+                         "zfs get -H -o value mountpoint '%s' 2>/dev/null", dataset);
+        if (n < 0 || n >= (int)sizeof(cmd))
+                return (NULL);
+
+        p = popen(cmd, "r");
+        if (p == NULL)
+                return (NULL);
+
+        if (fgets(buf, sizeof(buf), p) != NULL) {
+                size_t l = strlen(buf);
+                if (l > 0 && buf[l - 1] == '\n')
+                        buf[l - 1] = '\0';
+                if (buf[0] == '/') {
+                        result = strdup(buf);
+                        if (result == NULL) {
+                                SAVE_ERRNO(pclose(p));
+                                err(EXIT_FAILURE, "strdup");
+                        }
+                }
+        }
+        pclose(p);
+        return (result);
+}
+
+/* Returns true iff path is exactly prefix or under prefix/. */
+static bool
+path_under(const char *path, const char *prefix)
+{
+        size_t pl = strlen(prefix);
+
+        if (strncmp(path, prefix, pl) != 0)
                 return (false);
-        return (dataset[pl] == '\0' || dataset[pl] == '/');
+        return (path[pl] == '\0' || path[pl] == '/');
 }
 
 static struct capabilities_v3 caps;
@@ -233,19 +277,31 @@ main(int argc, char *argv[])
         if (parent_ds == NULL)
                 errx(EXIT_FAILURE, "no ZFS dataset is mounted at or above %s", data_path);
 
-        if (!dataset_under(dataset, parent_ds))
+        if (!path_under(dataset, parent_ds))
                 errx(EXIT_FAILURE, "dataset %s is not under %s", dataset, parent_ds);
-
-        /* TODO Task 4: look up dataset's mountpoint property; mount(2) it */
 
         if (do_unmount) {
                 /* TODO Task 5 */
                 errx(EXIT_FAILURE, "unmount not implemented yet");
         }
 
-        if (do_mount(dataset, "/tmp/zfs-mount-skeleton-stub", "zfs", 0, NULL) < 0)
-                err(EXIT_FAILURE, "mount failed");
+        char *mp = get_mountpoint(dataset);
+        if (mp == NULL)
+                errx(EXIT_FAILURE, "could not get mountpoint of %s (is it set to a path?)", dataset);
+        if (!path_under(mp, data_path))
+                errx(EXIT_FAILURE, "mountpoint %s is not under %s", mp, data_path);
 
+        /* mkdir runs as the calling uid (DAC_OVERRIDE is in permitted but not
+         * effective; we don't raise it). If the dir already exists this is a
+         * no-op. If the calling user can't create it, that's the right
+         * outcome — they don't have access to the parent. */
+        if (mkdir(mp, 0755) < 0 && errno != EEXIST)
+                err(EXIT_FAILURE, "mkdir %s", mp);
+
+        if (do_mount(dataset, mp, "zfs", 0, NULL) < 0)
+                err(EXIT_FAILURE, "mount %s on %s", dataset, mp);
+
+        free(mp);
         free(parent_ds);
         free(data_path);
         return (EXIT_SUCCESS);
