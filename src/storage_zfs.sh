@@ -38,3 +38,9 @@ zfs::checkenv() {
     common::checkcmd zfs sha256sum
     zfs::store_dataset > /dev/null
 }
+
+# Computes the sha256 of a squashfs image file. Used as the template cache key.
+zfs::image_sha256() {
+    local -r image="$1"
+    sha256sum "${image}" | awk '{print $1}'
+}
