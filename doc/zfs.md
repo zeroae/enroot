@@ -1,6 +1,6 @@
 # ZFS storage backend
 
-This document describes an optional ZFS-aware mode for the enroot container store. **Plans A (foundation) and E (ephemeral start) are implemented**: `enroot create`, `enroot remove`, and ephemeral `enroot start <image>` all use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI, Docker layer stacking on ZFS) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
+This document describes an optional ZFS-aware mode for the enroot container store. **Plans A (foundation), E (ephemeral start), and F (Docker load) are implemented**: `enroot create`, `enroot remove`, ephemeral `enroot start <image>`, and `enroot load docker://...` all use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
 
 ## Motivation
 
@@ -222,7 +222,7 @@ When `ENROOT_STORAGE_BACKEND=zfs`, ZFS substitutes for the existing storage code
 | ------ | ------ | ------ |
 | `enroot create foo.sqsh` | `unsquashfs` into `<store>/<NAME>` | Extract once into `templates/<sha>`, `zfs clone templates/<sha>@pristine <user>/<NAME>`. |
 | `enroot start foo.sqsh` (ephemeral; no prior `create`) | `squashfuse` lower layer + overlay upper layer, with kernel `overlay` or `fuse-overlayfs` selected by `ENROOT_NATIVE_OVERLAYFS`. | Ensure template, `zfs clone @pristine` to a unique ephemeral name, `zfs destroy` on exit. |
-| `enroot load docker://` (fetch + create in one step) | Layer-stack via `enroot-mksquashovlfs` overlay; requires `ENROOT_NATIVE_OVERLAYFS=y`. | Stack Docker layers as a chain of ZFS datasets — for each layer in order, `zfs clone parent@done` produces a writable child, the layer tarball is extracted into it with whiteout handling, then `zfs snapshot @done`. The leaf snapshot becomes the template's `@pristine`. Mirrors Docker's own `zfs` storage driver. |
+| `enroot load docker://` (fetch + create in one step) | Layer-stack via `enroot-mksquashovlfs` overlay; requires `ENROOT_NATIVE_OVERLAYFS=y`. | `docker::_prepare_layers` produces extracted, whiteout-converted layer directories `0/`, `1/`, …, `N/` exactly as on the `dir` backend. The merge step reuses the same `enroot-nsenter --user --remap-root` + `mount -t overlay lowerdir=0:1:…:N` pipeline, but the tar-pipe is redirected from a regular directory into the mountpoint of a freshly-created template clone (keyed by image config sha). Cache hits skip the merge entirely. `ENROOT_NATIVE_OVERLAYFS=y` is **not** required; ZFS replaces the precondition. |
 
 `ENROOT_NATIVE_OVERLAYFS` keeps its current meaning when the backend is `dir`. When the backend is `zfs`, the knob is irrelevant for the three substituted paths above (overlay is not used), but it continues to control overlay choice for any code path that does not yet have a ZFS substitution.
 

@@ -488,10 +488,10 @@ docker::import() (
 docker::load() (
     local -r uri="$1"
     local name="$2" arch="$3"
-    local user= registry= image= tag= tmpdir= config= layer_count=
+    local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
 
-    if [ -z "${ENROOT_NATIVE_OVERLAYFS-}" ]; then
-        common::err "ENROOT_NATIVE_OVERLAYFS=y is required for enroot load"
+    if ! zfs::enabled && [ -z "${ENROOT_NATIVE_OVERLAYFS-}" ]; then
+        common::err "ENROOT_NATIVE_OVERLAYFS=y or ENROOT_STORAGE_BACKEND=zfs is required for enroot load"
     fi
 
     common::checkcmd curl grep awk jq parallel tar "${ENROOT_GZIP_PROGRAM}" find zstd
@@ -514,12 +514,16 @@ docker::load() (
         name="${display_image////+}${tag:++${tag}}"
     fi
 
-    name=$(common::realpath "${ENROOT_DATA_PATH}/${name}")
-    if [ -e "${name}" ]; then
-        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
-            common::err "File already exists: ${name}"
-        else
-            common::rmall "${name}"
+    if zfs::enabled; then
+        zfs::container_check "${name}"
+    else
+        name=$(common::realpath "${ENROOT_DATA_PATH}/${name}")
+        if [ -e "${name}" ]; then
+            if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+                common::err "File already exists: ${name}"
+            else
+                common::rmall "${name}"
+            fi
         fi
     fi
 
@@ -540,11 +544,15 @@ docker::load() (
         unpriv=y
     fi
 
-    # Create a mount namespace and overlay mount
-    mkdir -p rootfs "${name}"
-    enroot-nsenter ${unpriv:+--user} --mount --remap-root \
-            bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
-                     tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${name}/' -xpf -"
+    if zfs::enabled; then
+        zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
+    else
+        # Create a mount namespace and overlay mount
+        mkdir -p rootfs "${name}"
+        enroot-nsenter ${unpriv:+--user} --mount --remap-root \
+                bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
+                         tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${name}/' -xpf -"
+    fi
 )
 
 docker::daemon::import() (
