@@ -790,8 +790,95 @@ zfs::docker_install_from_layers() {
 zfs::import_docker_pointer() (
     local -r uri="$1" output_path="$2"
     local arch="$3"
+    local config_sha= manifest_digest=
+
+    set -euo pipefail
+
+    # Fetch the manifest digest first (cheap HEAD on the manifest URL).
+    # docker::digest takes raw arch and normalizes internally — pass it
+    # the unmodified caller-supplied arch.
+    manifest_digest=$(docker::digest "${uri}" "${arch}")
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "registry returned invalid manifest digest: ${manifest_digest}"
+
+    # Convert the architecture to the debian format for the internal
+    # helpers. _pull_and_install_template expects already-normalized arch.
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
+
+    config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+
+    zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
+)
+
+# Create flow for a ZFS pointer file. Reads the pointer, then either:
+# (a) clones an already-cached template on hit, or
+# (b) re-pulls from the pointer's URI to repopulate an evicted template,
+#     then clones. The freshly-pulled image-config-sha256 must match the
+#     pointer's claim — otherwise the registry tag has been republished
+#     and the pointer is stale.
+#
+# Inputs:
+#   $1 pointer_path  - validated pointer file (caller already passed
+#                      zfs::is_pointer)
+#   $2 name          - user-visible container name (no slashes)
+zfs::create_from_pointer() (
+    local -r pointer_path="$1" name="$2"
+    local fresh_config_sha
+    local image_config_sha256= manifest_digest= arch= uri= imported=
+    local store template
+
+    set -euo pipefail
+
+    zfs::checkenv
+
+    # Parse the pointer (read_pointer validates each field against strict
+    # regexes; safe to eval).
+    eval "$(zfs::read_pointer "${pointer_path}")"
+
+    if zfs::template_exists "${image_config_sha256}"; then
+        store=$(zfs::store_dataset)
+        template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+        zfs::touch_template "${template}"
+        zfs::clone_container "${template}" "${name}"
+        return
+    fi
+
+    # Eviction recovery: re-pull from the registry. The new
+    # image-config-sha256 must match the pointer's claim; mismatch means
+    # the upstream tag has been republished, which we surface as a clear
+    # error rather than silently cloning a different image.
+    common::log INFO "Template ${image_config_sha256:0:12} evicted; re-pulling from ${uri}"
+    # The pointer's `arch` is already debian-normalized (write_pointer
+    # was given the normalized form), so pass it straight through to the
+    # puller, which expects normalized.
+    fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+    if [ "${fresh_config_sha}" != "${image_config_sha256}" ]; then
+        common::err "Pointer ${pointer_path} references image-config-sha256 ${image_config_sha256:0:12}, but ${uri} now resolves to ${fresh_config_sha:0:12}. Delete and re-import."
+    fi
+
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+    zfs::clone_container "${template}" "${name}"
+)
+
+# Internal helper used by both the import flow's recovery path and (via
+# zfs::import_docker_pointer) the main import flow. Pulls layers and
+# installs the template; prints the resolved image-config-sha256 so the
+# caller can validate it. Does NOT write a pointer file.
+#
+# Inputs:
+#   $1 uri    - docker:// URI
+#   $2 arch   - ALREADY debarch-normalized (callers must convert with
+#               common::debarch first, or pass through the value already
+#               stored in a pointer file).
+#
+# Subshell function for cwd / EXIT trap scoping (see import_docker_pointer
+# for the same rationale).
+zfs::_pull_and_install_template() (
+    local -r uri="$1" arch="$2"
     local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
-    local manifest_digest=
 
     set -euo pipefail
 
@@ -800,24 +887,6 @@ zfs::import_docker_pointer() (
     docker::_parse_uri "${uri}" \
       | { common::read -r user; common::read -r registry; common::read -r image; common::read -r tag; }
 
-    # Fetch the manifest digest first (cheap HEAD on the manifest URL).
-    # Done before the expensive layer pull so a registry-side mismatch
-    # fails fast. docker::digest takes raw arch ($3) and normalizes
-    # internally — pass it the unmodified caller-supplied arch.
-    manifest_digest=$(docker::digest "${uri}" "${arch}")
-    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || common::err "registry returned invalid manifest digest: ${manifest_digest}"
-
-    # Convert the architecture to the debian format for the internal
-    # helpers (docker::_prepare_layers, our own pointer file). Same
-    # convention as docker::import / docker::load.
-    if [ -n "${arch}" ]; then
-        arch=$(common::debarch "${arch}")
-    fi
-
-    # Create a temporary directory and chdir to it (same pattern as
-    # docker::import / docker::load — _prepare_layers writes layer
-    # directories into the cwd).
     trap 'common::rmall "${tmpdir}" 2> /dev/null; rm -f "${token_dir}"/*.$$ 2> /dev/null' EXIT
     tmpdir=$(common::mktmpdir enroot)
     common::chdir "${tmpdir}"
@@ -825,14 +894,11 @@ zfs::import_docker_pointer() (
     ENROOT_SET_USER_XATTRS=y docker::_prepare_layers "${user}" "${registry}" "${image}" "${tag}" "${arch}" \
       | { common::read -r config; common::read -r layer_count; }
 
-    # Running as a non-root user requires entering a user namespace for the
-    # tar-over-overlayfs merge inside _install_template_from_layers (same
-    # logic as docker::load).
     if [ "${EUID}" -ne 0 ]; then
         unpriv=y
     fi
 
     zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
 
-    zfs::write_pointer "${output_path}" "${config}" "${manifest_digest}" "${arch}" "${uri}"
+    printf "%s" "${config}"
 )
