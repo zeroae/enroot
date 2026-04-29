@@ -108,3 +108,28 @@ zfs::clone_container() {
 
     zfs clone "${template}@${zfs_pristine_snap}" "${target}"
 }
+
+# Destroys a user container and its template if no other clones reference the
+# template's @pristine snapshot. (Refcount-only behavior; warm-period eviction
+# is added in plan B.)
+zfs::destroy_container() {
+    local -r name="$1"
+    local -r store=$(zfs::store_dataset)
+    local -r target="${store}/${name}"
+    local origin
+
+    if ! zfs list -H "${target}" > /dev/null 2>&1; then
+        common::err "No such container: ${name}"
+    fi
+
+    origin=$(zfs get -H -o value origin "${target}")
+    zfs destroy "${target}"
+
+    # Try to destroy the origin's template if no other clones remain.
+    # 'zfs destroy' on a snapshot with clones fails harmlessly; we attempt and ignore.
+    if [ -n "${origin}" ] && [ "${origin}" != "-" ]; then
+        local template="${origin%@*}"
+        zfs destroy "${origin}" 2> /dev/null && \
+            zfs destroy "${template}" 2> /dev/null || :
+    fi
+}
