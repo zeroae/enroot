@@ -73,6 +73,25 @@ zfs::eviction_candidates() {
       | sort -t $'\t' -k2,2n
 }
 
+# Returns 0 if the templates dataset has a quota set and current usage is at
+# or above ENROOT_TEMPLATE_PRESSURE_THRESHOLD percent. Returns 1 otherwise
+# (no quota = no pressure check; under threshold = no pressure).
+zfs::under_pressure() {
+    local -r store=$(zfs::store_dataset)
+    local -r templates_dataset="${store}/${zfs_template_subdir}"
+    local quota used pct
+
+    zfs list -H "${templates_dataset}" > /dev/null 2>&1 || return 1
+
+    quota=$(zfs get -H -p -o value quota "${templates_dataset}")
+    [ "${quota}" = "0" ] || [ "${quota}" = "-" ] && return 1
+
+    used=$(zfs get -H -p -o value used "${templates_dataset}")
+    pct=$(( used * 100 / quota ))
+
+    [ "${pct}" -ge "${ENROOT_TEMPLATE_PRESSURE_THRESHOLD-80}" ]
+}
+
 # Computes the sha256 of a squashfs image file. Used as the template cache key.
 zfs::image_sha256() {
     local -r image="$1"
