@@ -40,6 +40,87 @@ zfs::checkenv() {
     zfs::store_dataset > /dev/null
 }
 
+# Updates the enroot:last_used user property on a template dataset to now.
+# Used by the eviction sweep to distinguish warm (recently-used) templates
+# from cold (idle past ENROOT_TEMPLATE_WARM_SECONDS) ones. Best-effort: a
+# read-only template (set by ensure_template) is touched via -o so the
+# readonly property doesn't block the metadata update.
+zfs::touch_template() {
+    local -r template="$1"
+    zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
+}
+
+# Prints "<dataset>\t<last_used_epoch>" for each evictable template, sorted
+# oldest-first. A template is evictable iff it has @pristine and that snapshot
+# has no clones referencing it. Datasets without a last_used property report
+# "-"; the sweep treats these as cold (effectively age = +infinity).
+zfs::eviction_candidates() {
+    local -r store=$(zfs::store_dataset)
+    local -r templates_dataset="${store}/${zfs_template_subdir}"
+    local ds ts clones
+
+    # Bail if the templates parent doesn't exist yet.
+    zfs list -H "${templates_dataset}" > /dev/null 2>&1 || return 0
+
+    # Direct children only (-d 1, exclude self via $1 != ds-parent).
+    while IFS=$'\t' read -r ds ts; do
+        [ "${ds}" = "${templates_dataset}" ] && continue
+        clones=$(zfs get -H -o value clones "${ds}@${zfs_pristine_snap}" 2> /dev/null) || continue
+        if [ -z "${clones}" ] || [ "${clones}" = "-" ]; then
+            printf "%s\t%s\n" "${ds}" "${ts:--}"
+        fi
+    done < <(zfs list -H -r -d 1 -t filesystem -o name,enroot:last_used "${templates_dataset}") \
+      | sort -t $'\t' -k2,2n
+}
+
+# Returns 0 if the templates dataset has a quota set and current usage is at
+# or above ENROOT_TEMPLATE_PRESSURE_THRESHOLD percent. Returns 1 otherwise
+# (no quota = no pressure check; under threshold = no pressure).
+zfs::under_pressure() {
+    local -r store=$(zfs::store_dataset)
+    local -r templates_dataset="${store}/${zfs_template_subdir}"
+    local quota used pct
+
+    zfs list -H "${templates_dataset}" > /dev/null 2>&1 || return 1
+
+    quota=$(zfs get -H -p -o value quota "${templates_dataset}")
+    [ "${quota}" = "0" ] || [ "${quota}" = "-" ] && return 1
+
+    used=$(zfs get -H -p -o value used "${templates_dataset}")
+    pct=$(( used * 100 / quota ))
+
+    [ "${pct}" -ge "${ENROOT_TEMPLATE_PRESSURE_THRESHOLD-80}" ]
+}
+
+# Sweeps evictable templates. Always reaps cold ones (last_used older than
+# ENROOT_TEMPLATE_WARM_SECONDS); also reaps warm ones LRU when under pressure,
+# stopping once back under threshold. With ENROOT_TEMPLATE_WARM_SECONDS=0 and
+# no quota, this collapses to "reap any template with no clones" (refcount-only
+# behavior, equivalent to Plan A's destroy_container).
+zfs::sweep_templates() {
+    local now warm_secs pressure ds ts age is_warm
+    now=$(date +%s)
+    warm_secs="${ENROOT_TEMPLATE_WARM_SECONDS-604800}"
+    zfs::under_pressure && pressure=y || pressure=
+
+    zfs::eviction_candidates | while IFS=$'\t' read -r ds ts; do
+        if [ -z "${ts}" ] || [ "${ts}" = "-" ]; then
+            age=$((warm_secs + 1))   # missing timestamp = treat as cold
+        else
+            age=$(( now - ts ))
+        fi
+        if [ "${age}" -lt "${warm_secs}" ] && [ -z "${pressure}" ]; then
+            continue                  # warm and no pressure: keep
+        fi
+        common::log INFO "Evicting template ${ds##*/} (age ${age}s)"
+        zfs destroy "${ds}@${zfs_pristine_snap}" 2> /dev/null || :
+        zfs destroy "${ds}" 2> /dev/null || :
+        if [ -n "${pressure}" ]; then
+            zfs::under_pressure || break
+        fi
+    done
+}
+
 # Computes the sha256 of a squashfs image file. Used as the template cache key.
 zfs::image_sha256() {
     local -r image="$1"
@@ -58,8 +139,11 @@ zfs::ensure_template() {
     local mountpoint
     local i timeout=600
 
+    zfs::sweep_templates
+
     # Fast path: template already exists with @pristine.
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
     fi
@@ -70,12 +154,20 @@ zfs::ensure_template() {
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         common::log INFO "Extracting squashfs filesystem into ZFS template..." NL
         [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
-        unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
-                   -user-xattrs -f -d "${mountpoint}" "${image}" >&2
+        if ! unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
+                        -user-xattrs -f -d "${mountpoint}" "${image}" >&2; then
+            common::log WARN "Extraction failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
+                       -user-xattrs -f -d "${mountpoint}" "${image}" >&2 \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Extraction failed even after evicting warm templates"; }
+        fi
         common::fixperms "${mountpoint}"
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
+        zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
     fi
@@ -110,29 +202,20 @@ zfs::clone_container() {
     zfs clone "${template}@${zfs_pristine_snap}" "${target}"
 }
 
-# Destroys a user container and its template if no other clones reference the
-# template's @pristine snapshot. (Refcount-only behavior; warm-period eviction
-# is added in plan B.)
+# Destroys a user container. The clone's origin template is left in place;
+# its lifecycle is owned by zfs::sweep_templates (warm/cold/pressure-driven
+# eviction on next create), so a remove + re-create cycle within
+# ENROOT_TEMPLATE_WARM_SECONDS reuses the cached template instead of
+# re-extracting.
 zfs::destroy_container() {
     local -r name="$1"
     local -r store=$(zfs::store_dataset)
     local -r target="${store}/${name}"
-    local origin
 
     if ! zfs list -H "${target}" > /dev/null 2>&1; then
         common::err "No such container: ${name}"
     fi
-
-    origin=$(zfs get -H -o value origin "${target}")
     zfs destroy "${target}"
-
-    # Try to destroy the origin's template if no other clones remain.
-    # 'zfs destroy' on a snapshot with clones fails harmlessly; we attempt and ignore.
-    if [ -n "${origin}" ] && [ "${origin}" != "-" ]; then
-        local template="${origin%@*}"
-        zfs destroy "${origin}" 2> /dev/null && \
-            zfs destroy "${template}" 2> /dev/null || :
-    fi
 }
 
 # Creates an ephemeral clone of the template for the given image and prints its
@@ -201,20 +284,28 @@ zfs::docker_install_from_layers() {
     tmp="${template}.tmp"
     snap="${template}@${zfs_pristine_snap}"
 
+    zfs::sweep_templates
+
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
         common::log INFO "Reusing cached template ${cache_key:0:12}"
+        zfs::touch_template "${template}"
     elif zfs create -p "${tmp}" 2> /dev/null; then
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         mkdir -p rootfs
-        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root \
-                bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
-                         tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"; then
-            zfs destroy -r "${tmp}" 2> /dev/null || :
-            common::err "Failed to merge Docker layers into ZFS template"
+        local merge_cmd
+        merge_cmd="mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
+                   tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${merge_cmd}"; then
+            common::log WARN "Layer merge failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${merge_cmd}" \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Failed to merge Docker layers into ZFS template even after evicting warm templates"; }
         fi
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
+        zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
         while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
