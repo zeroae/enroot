@@ -391,8 +391,6 @@ runtime::exec() {
 runtime::create() {
     local image="$1" rootfs="$2"
 
-    common::checkcmd unsquashfs find
-
     # Resolve the container image path.
     if [ -z "${image}" ]; then
         common::err "Invalid argument"
@@ -405,14 +403,28 @@ runtime::create() {
         common::err "Invalid image format: ${image}"
     fi
 
-    # Resolve the container rootfs path.
+    # Resolve the container rootfs name.
     if [ -z "${rootfs}" ]; then
         rootfs=$(basename "${image%.sqsh}")
     fi
     if [[ "${rootfs}" == */* ]]; then
         common::err "Invalid argument: ${rootfs}"
     fi
-    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs}")
+
+    if zfs::enabled; then
+        runtime::_create_zfs "${image}" "${rootfs}"
+    else
+        runtime::_create_dir "${image}" "${rootfs}"
+    fi
+}
+
+runtime::_create_dir() {
+    local -r image="$1" rootfs_name="$2"
+    local rootfs
+
+    common::checkcmd unsquashfs find
+
+    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ -e "${rootfs}" ]; then
         if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
             common::err "File already exists: ${rootfs}"
@@ -421,12 +433,21 @@ runtime::create() {
         fi
     fi
 
-    # Extract the container rootfs from the image.
     common::log INFO "Extracting squashfs filesystem..." NL
     # XXX: https://github.com/NVIDIA/enroot/issues/90
     [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
     unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" -user-xattrs -d "${rootfs}" "${image}" >&2
     common::fixperms "${rootfs}"
+}
+
+runtime::_create_zfs() {
+    local -r image="$1" rootfs_name="$2"
+    local sha template
+
+    zfs::checkenv
+    sha=$(zfs::image_sha256 "${image}")
+    template=$(zfs::ensure_template "${image}" "${sha}")
+    zfs::clone_container "${template}" "${rootfs_name}"
 }
 
 runtime::digest() {
