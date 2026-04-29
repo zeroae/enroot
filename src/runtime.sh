@@ -537,6 +537,8 @@ runtime::import() {
         docker::import "${uri}" "${filename}" "${arch}" ;;
     dockerd://* | podman://*)
         docker::daemon::import "${uri}" "${filename}" "${arch}" ;;
+    zfs://*)
+        zfs::import_uri "${uri}" "${filename}" ;;
     *)
         common::err "Invalid argument: ${uri}" ;;
     esac
@@ -559,6 +561,11 @@ runtime::load() {
     case "${uri}" in
     docker://*)
         docker::load "${uri}" "${rootfs}" "${arch}" ;;
+    zfs://*)
+        if ! zfs::enabled; then
+            common::err "zfs:// URIs require ENROOT_STORAGE_BACKEND=zfs"
+        fi
+        zfs::pull_via_ssh "${uri}" "${rootfs}" ;;
     *)
         common::err "Invalid argument: ${uri}" ;;
     esac
@@ -572,6 +579,15 @@ runtime::export() {
     fi
     if [[ "${rootfs_name}" == */* ]]; then
         common::err "Invalid argument: ${rootfs_name}"
+    fi
+
+    # Destination is a zfs:// URI: push to a remote enroot host over SSH.
+    if [[ "${filename}" == zfs://* ]]; then
+        if ! zfs::enabled; then
+            common::err "zfs:// destinations require ENROOT_STORAGE_BACKEND=zfs"
+        fi
+        zfs::push_via_ssh "${rootfs_name}" "${filename}"
+        return
     fi
 
     case "${format}" in

@@ -170,9 +170,9 @@ enroot::usage() {
 		Create a container image from a container root filesystem.
 		
 		 Options:
-		   -o, --output  Name of the output image file (defaults to "NAME.sqsh" or "NAME.zfs")
+		   -o, --output  Output destination: a filename (defaults to "NAME.sqsh" or "NAME.zfs") or a "zfs://[USER@]HOST[/REMOTE_NAME]" URI to push to a remote enroot host over SSH
 		   -f, --force   Overwrite an existing container image
-		       --format  Output format: "sqsh" (default) or "zfs" (zfs send stream; requires ZFS backend)
+		       --format  Output format for file destinations: "sqsh" (default) or "zfs" (zfs send stream; requires ZFS backend)
 		EOF
         ;;
     import)
@@ -185,10 +185,11 @@ enroot::usage() {
 		   docker://[USER@][REGISTRY#]IMAGE[:TAG]  Import a Docker image from a registry
 		   dockerd://IMAGE[:TAG]                   Import a Docker image from the Docker daemon
 		   podman://IMAGE[:TAG]                    Import a Docker image from a local podman repository
+		   zfs://[USER@]HOST/NAME                  Import a container from a remote enroot host (defaults to ".zfs"; ".sqsh" produced if -o ends in .sqsh, requires local ZFS backend)
 
 		 Options:
 		   -a, --arch    Architecture of the image (defaults to host architecture)
-		   -o, --output  Name of the output image file (defaults to "URI.sqsh")
+		   -o, --output  Name of the output image file (defaults to "URI.sqsh" or "URI.zfs" for zfs://)
 		EOF
         ;;
     digest)
@@ -212,6 +213,7 @@ enroot::usage() {
 		
 		 Schemes:
 		   docker://[USER@][REGISTRY#]IMAGE[:TAG]  Load a Docker image from a registry
+		   zfs://[USER@]HOST/NAME                  Pull a container from a remote enroot host (full zfs send stream over SSH; both hosts must run the ZFS backend)
 
 		 Options:
 		   -a, --arch    Architecture of the image (defaults to host architecture)
@@ -355,7 +357,7 @@ enroot::digest() {
 }
 
 enroot::import() {
-    local uri= filename= arch=
+    local uri= filename= arch= name= zfs_recv=
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -379,6 +381,20 @@ enroot::import() {
            filename="${1#*=}"
            shift
            ;;
+        -n|--name)
+            [ -z "${2-}" ] && enroot::usage import 1
+            name="$2"
+            shift 2
+            ;;
+        --name=*)
+            [ -z "${1#*=}" ] && enroot::usage import 1
+            name="${1#*=}"
+            shift
+            ;;
+        --zfs-recv)
+            zfs_recv=y
+            shift
+            ;;
         -h|--help)
             enroot::usage import 0 ;;
         --)
@@ -389,6 +405,19 @@ enroot::import() {
             break ;;
         esac
     done
+
+    # Internal --zfs-recv: read a stream from stdin and clone to NAME, no URI.
+    if [ -n "${zfs_recv}" ]; then
+        if ! zfs::enabled; then
+            common::err "--zfs-recv requires ENROOT_STORAGE_BACKEND=zfs"
+        fi
+        if [ -z "${name}" ]; then
+            common::err "--zfs-recv requires -n NAME"
+        fi
+        zfs::recv_to_template_stdin "${name}"
+        return
+    fi
+
     if [ $# -ne 1 ]; then
         enroot::usage import 1
     fi
@@ -445,7 +474,7 @@ enroot::load() {
 }
 
 enroot::export() {
-    local name= filename= format=sqsh
+    local name= filename= format=sqsh zfs_send=
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -473,6 +502,10 @@ enroot::export() {
             format="${1#*=}"
             shift
             ;;
+        --zfs-send)
+            zfs_send=y
+            shift
+            ;;
         -h|--help)
             enroot::usage export 0 ;;
         --)
@@ -487,6 +520,15 @@ enroot::export() {
         enroot::usage export 1
     fi
     name="$1"
+
+    # Internal --zfs-send: write a stream to stdout, no filename or format.
+    if [ -n "${zfs_send}" ]; then
+        if ! zfs::enabled; then
+            common::err "--zfs-send requires ENROOT_STORAGE_BACKEND=zfs"
+        fi
+        zfs::send_clone_stdout "${name}"
+        return
+    fi
 
     runtime::export "${name}" "${filename}" "${format}"
 }

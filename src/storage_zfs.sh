@@ -262,6 +262,152 @@ zfs::container_check() {
     fi
 }
 
+# Parses a zfs:// URI and prints two lines: the host and the container name
+# (NAME may contain extra path components which are reassembled into the
+# container name). Matches the docker::_parse_uri output convention so callers
+# can use the same `common::read -r` pattern.
+zfs::parse_uri() {
+    local -r uri="$1"
+    if [[ ! "${uri}" =~ ^zfs://([^/]+)/(.+)$ ]]; then
+        common::err "Invalid zfs:// URI: ${uri}"
+    fi
+    printf "%s\n%s\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+# Sends a clone's @pristine snapshot (or a fresh snapshot if the container is
+# not a clone) to stdout. Used by --zfs-send.
+zfs::send_clone_stdout() {
+    local -r name="$1"
+    local -r store=$(zfs::store_dataset)
+    local -r target="${store}/${name}"
+    local origin
+
+    if ! zfs list -H "${target}" > /dev/null 2>&1; then
+        common::err "No such container: ${name}"
+    fi
+
+    origin=$(zfs get -H -o value origin "${target}")
+    if [ -z "${origin}" ] || [ "${origin}" = "-" ]; then
+        local snap="${target}@enroot-export-$$"
+        zfs snapshot "${snap}"
+        trap "zfs destroy '${snap}' 2> /dev/null || :" RETURN
+        zfs send "${snap}"
+    else
+        zfs send "${origin}"
+    fi
+}
+
+# Receives a zfs send stream from stdin into the template cache, then clones
+# the resulting template into a named user container. Used by --zfs-recv.
+# The cache key is the sha256 of the (buffered) stream bytes — same scheme as
+# zfs::create_from_stream uses for .zfs files.
+zfs::recv_to_template_stdin() {
+    local -r name="$1"
+    local buf sha template
+
+    buf=$(mktemp -p "${ENROOT_TEMP_PATH:-/tmp}" enroot-recv.XXXXXX)
+    trap "rm -f '${buf}' 2> /dev/null || :" RETURN
+    cat > "${buf}"
+    sha=$(zfs::image_sha256 "${buf}")
+    template=$(zfs::ensure_template_from_stream "${buf}" "${sha}")
+    zfs::clone_container "${template}" "${name}"
+}
+
+# Imports a container from a remote enroot host over SSH and writes a file.
+# Output format is inferred from the filename extension: ".sqsh" produces a
+# squashfs (requires local ZFS to receive into a temp dataset, mksquashfs out,
+# then destroy the temp); anything else produces a raw zfs send stream
+# (".zfs" by convention; no local ZFS receive required).
+zfs::import_uri() {
+    local -r uri="$1"
+    local filename="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    zfs::parse_uri "${uri}" \
+      | { common::read -r host; common::read -r remote_name; }
+
+    if [ -z "${filename}" ]; then
+        filename="${remote_name##*/}.zfs"
+    fi
+    filename=$(common::realpath "${filename}")
+    if [ -e "${filename}" ]; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "File already exists: ${filename}"
+        else
+            rm -f "${filename}"
+        fi
+    fi
+
+    case "${filename}" in
+        *.sqsh)
+            zfs::checkenv
+            common::checkcmd mksquashfs
+            local -r store=$(zfs::store_dataset)
+            local -r tmp_ds="${store}/${zfs_template_subdir}/import-$$.tmp"
+            local mountpoint
+            zfs create -p "${store}/${zfs_template_subdir}" 2> /dev/null || :
+            common::log INFO "Pulling ${remote_name} from ${host} (sqsh)" NL
+            if ! ssh "${host}" enroot export --zfs-send "${remote_name}" \
+                  | zfs receive -F "${tmp_ds}"; then
+                zfs destroy -r "${tmp_ds}" 2> /dev/null || :
+                common::err "Receive from ${uri} failed"
+            fi
+            mountpoint=$(zfs get -H -o value mountpoint "${tmp_ds}")
+            common::log INFO "Creating squashfs filesystem..." NL
+            mksquashfs "${mountpoint}" "${filename}" -all-root ${TTY_OFF+-no-progress} \
+              -processors "${ENROOT_MAX_PROCESSORS}" ${ENROOT_SQUASH_OPTIONS} >&2 \
+              || { zfs destroy -r "${tmp_ds}" 2> /dev/null || :; \
+                   common::err "mksquashfs failed"; }
+            zfs destroy -r "${tmp_ds}"
+            ;;
+        *)
+            common::log INFO "Pulling ${remote_name} from ${host} (zfs send stream)" NL
+            ssh "${host}" enroot export --zfs-send "${remote_name}" > "${filename}" \
+              || { rm -f "${filename}"; common::err "ssh transport failed for ${uri}"; }
+            ;;
+    esac
+}
+
+# Pulls a container from a remote enroot host over SSH. URI is zfs://host/NAME;
+# the SSH peer must be running enroot with the ZFS backend. Local NAME
+# defaults to the URI's basename if not given.
+zfs::pull_via_ssh() {
+    local -r uri="$1"
+    local name="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    zfs::parse_uri "${uri}" \
+      | { common::read -r host; common::read -r remote_name; }
+
+    [ -z "${name}" ] && name="${remote_name##*/}"
+
+    common::log INFO "Pulling ${remote_name} from ${host}" NL
+    ssh "${host}" enroot export --zfs-send "${remote_name}" \
+      | zfs::recv_to_template_stdin "${name}"
+}
+
+# Pushes a local container to a remote enroot host over SSH. URI may be
+# zfs://host (push under the same NAME) or zfs://host/REMOTE_NAME (rename on
+# the remote side).
+zfs::push_via_ssh() {
+    local -r name="$1" uri="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    if [[ "${uri}" =~ ^zfs://([^/]+)/?(.*)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        remote_name="${BASH_REMATCH[2]:-${name}}"
+    else
+        common::err "Invalid zfs:// URI: ${uri}"
+    fi
+
+    common::log INFO "Pushing ${name} to ${host} as ${remote_name}" NL
+    zfs::send_clone_stdout "${name}" \
+      | ssh "${host}" enroot import --zfs-recv -n "${remote_name}"
+}
+
 # Materializes a ZFS stream file into a template (cached by file sha) and
 # clones it as the user's named container. Counterpart of zfs::ensure_template
 # + zfs::clone_container for the .sqsh path; this is called from runtime::create
