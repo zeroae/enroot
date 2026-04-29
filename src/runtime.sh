@@ -437,23 +437,47 @@ runtime::create() {
     if [ ! -f "${image}" ]; then
         common::err "No such file or directory: ${image}"
     fi
-    if ! unsquashfs -s "${image}" > /dev/null 2>&1; then
-        common::err "Invalid image format: ${image}"
-    fi
 
-    # Resolve the container rootfs name.
-    if [ -z "${rootfs}" ]; then
-        rootfs=$(basename "${image%.sqsh}")
-    fi
-    if [[ "${rootfs}" == */* ]]; then
-        common::err "Invalid argument: ${rootfs}"
-    fi
+    case "${image}" in
+        *.zfs)
+            if ! zfs::enabled; then
+                common::err ".zfs images require ENROOT_STORAGE_BACKEND=zfs"
+            fi
+            if [ -z "${rootfs}" ]; then
+                rootfs=$(basename "${image%.zfs}")
+            fi
+            if [[ "${rootfs}" == */* ]]; then
+                common::err "Invalid argument: ${rootfs}"
+            fi
+            runtime::_create_zfs_from_stream "${image}" "${rootfs}"
+            ;;
+        *)
+            if ! unsquashfs -s "${image}" > /dev/null 2>&1; then
+                common::err "Invalid image format: ${image} (expected .sqsh or .zfs)"
+            fi
+            if [ -z "${rootfs}" ]; then
+                rootfs=$(basename "${image%.sqsh}")
+            fi
+            if [[ "${rootfs}" == */* ]]; then
+                common::err "Invalid argument: ${rootfs}"
+            fi
+            if zfs::enabled; then
+                runtime::_create_zfs "${image}" "${rootfs}"
+            else
+                runtime::_create_dir "${image}" "${rootfs}"
+            fi
+            ;;
+    esac
+}
 
-    if zfs::enabled; then
-        runtime::_create_zfs "${image}" "${rootfs}"
-    else
-        runtime::_create_dir "${image}" "${rootfs}"
-    fi
+runtime::_create_zfs_from_stream() {
+    local -r image="$1" rootfs_name="$2"
+    local sha template
+
+    zfs::checkenv
+    sha=$(zfs::image_sha256 "${image}")
+    template=$(zfs::ensure_template_from_stream "${image}" "${sha}")
+    zfs::clone_container "${template}" "${rootfs_name}"
 }
 
 runtime::_create_dir() {
