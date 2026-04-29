@@ -486,6 +486,7 @@ runtime::_create_dir() {
 
     common::checkcmd unsquashfs find
 
+    # Resolve the container rootfs path.
     rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ -e "${rootfs}" ]; then
         if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
@@ -495,6 +496,7 @@ runtime::_create_dir() {
         fi
     fi
 
+    # Extract the container rootfs from the image.
     common::log INFO "Extracting squashfs filesystem..." NL
     # XXX: https://github.com/NVIDIA/enroot/issues/90
     [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
@@ -606,11 +608,13 @@ runtime::_export_sqsh() {
 
     common::checkcmd mksquashfs
 
+    # Resolve the container rootfs path.
     rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
 
+    # Generate an absolute filename if none was specified.
     if [ -z "${filename}" ]; then
         filename="$(basename "${rootfs}").sqsh"
     fi
@@ -632,6 +636,7 @@ runtime::_export_sqsh() {
         exclude+=("${rootfs}${lock_file}")
     fi
 
+    # Export a container image from the rootfs specified.
     common::log INFO "Creating squashfs filesystem..." NL
     mksquashfs "${rootfs}" "${filename}" -all-root ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
       ${ENROOT_SQUASH_OPTIONS} ${exclude[@]+-e "${exclude[@]}"} >&2
@@ -720,6 +725,7 @@ runtime::list() {
 runtime::remove() {
     local rootfs_name="$1"
 
+    # Resolve the container rootfs path.
     if [ -z "${rootfs_name}" ]; then
         common::err "Invalid argument"
     fi
@@ -741,6 +747,8 @@ runtime::_remove_dir() {
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
+
+    # Remove the rootfs specified after asking for confirmation.
     if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
         read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
     fi
@@ -753,6 +761,8 @@ runtime::_remove_zfs() {
     local -r rootfs_name="$1"
     local rootfs
     rootfs="${ENROOT_DATA_PATH}/${rootfs_name}"
+
+    # Remove the rootfs specified after asking for confirmation.
     if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
         read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
     fi
