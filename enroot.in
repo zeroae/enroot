@@ -113,6 +113,7 @@ export ENROOT_VERSION="@version@"
 source "${ENROOT_LIBRARY_PATH}/common.sh"
 source "${ENROOT_LIBRARY_PATH}/docker.sh"
 source "${ENROOT_LIBRARY_PATH}/runtime.sh"
+source "${ENROOT_LIBRARY_PATH}/storage_zfs.sh"
 
 enroot::usage() {
     case "$1" in
