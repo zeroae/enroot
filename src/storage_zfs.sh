@@ -262,14 +262,16 @@ zfs::container_check() {
     fi
 }
 
-# Parses a zfs:// URI into "host\tname". Format: zfs://host/NAME (NAME may
-# contain extra path components which are reassembled into the container name).
+# Parses a zfs:// URI and prints two lines: the host and the container name
+# (NAME may contain extra path components which are reassembled into the
+# container name). Matches the docker::_parse_uri output convention so callers
+# can use the same `common::read -r` pattern.
 zfs::parse_uri() {
     local -r uri="$1"
     if [[ ! "${uri}" =~ ^zfs://([^/]+)/(.+)$ ]]; then
         common::err "Invalid zfs:// URI: ${uri}"
     fi
-    printf "%s\t%s" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    printf "%s\n%s\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
 }
 
 # Sends a clone's @pristine snapshot (or a fresh snapshot if the container is
