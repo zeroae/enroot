@@ -313,6 +313,62 @@ zfs::recv_to_template_stdin() {
     zfs::clone_container "${template}" "${name}"
 }
 
+# Imports a container from a remote enroot host over SSH and writes a file.
+# Output format is inferred from the filename extension: ".sqsh" produces a
+# squashfs (requires local ZFS to receive into a temp dataset, mksquashfs out,
+# then destroy the temp); anything else produces a raw zfs send stream
+# (".zfs" by convention; no local ZFS receive required).
+zfs::import_uri() {
+    local -r uri="$1"
+    local filename="$2"
+    local host remote_name
+
+    common::checkcmd ssh
+    zfs::parse_uri "${uri}" \
+      | { common::read -r host; common::read -r remote_name; }
+
+    if [ -z "${filename}" ]; then
+        filename="${remote_name##*/}.zfs"
+    fi
+    filename=$(common::realpath "${filename}")
+    if [ -e "${filename}" ]; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "File already exists: ${filename}"
+        else
+            rm -f "${filename}"
+        fi
+    fi
+
+    case "${filename}" in
+        *.sqsh)
+            zfs::checkenv
+            common::checkcmd mksquashfs
+            local -r store=$(zfs::store_dataset)
+            local -r tmp_ds="${store}/${zfs_template_subdir}/import-$$.tmp"
+            local mountpoint
+            zfs create -p "${store}/${zfs_template_subdir}" 2> /dev/null || :
+            common::log INFO "Pulling ${remote_name} from ${host} (sqsh)" NL
+            if ! ssh "${host}" enroot export --zfs-send "${remote_name}" \
+                  | zfs receive -F "${tmp_ds}"; then
+                zfs destroy -r "${tmp_ds}" 2> /dev/null || :
+                common::err "Receive from ${uri} failed"
+            fi
+            mountpoint=$(zfs get -H -o value mountpoint "${tmp_ds}")
+            common::log INFO "Creating squashfs filesystem..." NL
+            mksquashfs "${mountpoint}" "${filename}" -all-root ${TTY_OFF+-no-progress} \
+              -processors "${ENROOT_MAX_PROCESSORS}" ${ENROOT_SQUASH_OPTIONS} >&2 \
+              || { zfs destroy -r "${tmp_ds}" 2> /dev/null || :; \
+                   common::err "mksquashfs failed"; }
+            zfs destroy -r "${tmp_ds}"
+            ;;
+        *)
+            common::log INFO "Pulling ${remote_name} from ${host} (zfs send stream)" NL
+            ssh "${host}" enroot export --zfs-send "${remote_name}" > "${filename}" \
+              || { rm -f "${filename}"; common::err "ssh transport failed for ${uri}"; }
+            ;;
+    esac
+}
+
 # Pulls a container from a remote enroot host over SSH. URI is zfs://host/NAME;
 # the SSH peer must be running enroot with the ZFS backend. Local NAME
 # defaults to the URI's basename if not given.

@@ -538,7 +538,7 @@ runtime::import() {
     dockerd://* | podman://*)
         docker::daemon::import "${uri}" "${filename}" "${arch}" ;;
     zfs://*)
-        common::err "zfs:// has no portable file artifact; use 'enroot load zfs://...'" ;;
+        zfs::import_uri "${uri}" "${filename}" ;;
     *)
         common::err "Invalid argument: ${uri}" ;;
     esac
