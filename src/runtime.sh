@@ -175,6 +175,11 @@ runtime::_mount_rootfs() {
     local -r image="$1" rootfs="$2"
     local pid=0 rv=0
 
+    if zfs::enabled; then
+        runtime::_mount_rootfs_zfs "${image}" "${rootfs}"
+        return
+    fi
+
     common::checkcmd squashfuse mountpoint
     if [ -z "${ENROOT_NATIVE_OVERLAYFS-}" ]; then
         common::checkcmd fuse-overlayfs
@@ -208,6 +213,27 @@ runtime::_mount_rootfs() {
     fi
     exec {fd}>&-
     disown "${pid}" > /dev/null 2>&1
+}
+
+runtime::_mount_rootfs_zfs() {
+    local -r image="$1" rootfs="$2"
+    local out clone mountpoint
+
+    zfs::checkenv
+
+    out=$(zfs::ephemeral_clone "${image}")
+    clone="${out%%$'\t'*}"
+    mountpoint="${out##*$'\t'}"
+
+    # Bind-mount the ephemeral clone's mountpoint over the placeholder rootfs
+    # path the caller already prepared, so the rest of runtime::_start operates
+    # on it identically to the squashfuse+overlay path.
+    cat <<- EOF | enroot-mount -
+	${mountpoint} ${rootfs} none rbind
+	EOF
+
+    # Stash the clone name so runtime::_start's cleanup trap can destroy it on exit.
+    printf "%s\n" "${clone}" > "${ENROOT_RUNTIME_PATH}/zfs_ephemeral"
 }
 
 runtime::_start() {
