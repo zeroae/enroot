@@ -178,12 +178,18 @@ zfs::write_pointer() {
     local -r output="$1" config_sha="$2" manifest_digest="$3" arch="$4" uri="$5"
     local tmp imported
 
+    # Strict regexes here are not just sanity checks — read_pointer prints
+    # KEY=VALUE pairs that callers consume via eval. Any value that flows
+    # into eval must be free of shell metacharacters ($, `, ;, (, ), |, &,
+    # space, newline, etc.). The character classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "zfs::write_pointer: invalid image-config-sha256: ${config_sha}"
     [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
       || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
-    [[ "${uri}" =~ ^docker:// ]] \
-      || common::err "zfs::write_pointer: uri must start with docker://: ${uri}"
+    [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
+      || common::err "zfs::write_pointer: invalid arch: ${arch}"
+    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+      || common::err "zfs::write_pointer: invalid uri: ${uri}"
 
     imported=$(date -u +%FT%TZ)
     tmp="${output}.tmp.$$"
@@ -223,14 +229,19 @@ zfs::read_pointer() {
         esac
     done < <(tail -n +2 "${path}")
 
+    # All five fields are validated against strict regexes before output —
+    # the caller will eval the printed KEY=VALUE pairs, so values must be
+    # free of shell metacharacters. The classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "Pointer ${path} missing/invalid image-config-sha256"
     [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
       || common::err "Pointer ${path} missing/invalid manifest-digest"
     [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid arch"
-    [[ "${uri}" =~ ^docker:// ]] \
+    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid uri"
+    [[ "${imported}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+      || common::err "Pointer ${path} missing/invalid imported timestamp"
 
     printf "image-config-sha256=%s\n" "${config_sha}"
     printf "manifest-digest=%s\n"     "${manifest_digest}"
