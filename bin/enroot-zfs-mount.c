@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include <err.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,71 @@
 # define SYSCONFDIR "/usr/local/etc"
 #endif
 #define CONF_PATH SYSCONFDIR "/enroot/enroot.conf"
+
+/*
+ * Walks /proc/self/mounts looking for a "zfs" mount whose mountpoint covers
+ * `data_path` (i.e., is data_path itself or a path-component ancestor of it).
+ * Returns the longest-matching dataset name (malloc'd), or NULL if no zfs
+ * mount covers data_path.
+ */
+static char *
+resolve_parent_dataset(const char *data_path)
+{
+        FILE *f;
+        char *line = NULL, *best_src = NULL;
+        size_t len = 0, best_mp_len = 0, dp_len;
+        ssize_t n;
+
+        f = fopen("/proc/self/mounts", "r");
+        if (f == NULL)
+                err(EXIT_FAILURE, "cannot read /proc/self/mounts");
+
+        dp_len = strlen(data_path);
+
+        while ((n = getline(&line, &len, f)) != -1) {
+                char src[PATH_MAX], mp[PATH_MAX], type[64];
+                size_t mp_len;
+
+                if (sscanf(line, "%4095s %4095s %63s", src, mp, type) != 3)
+                        continue;
+                if (strcmp(type, "zfs") != 0)
+                        continue;
+
+                mp_len = strlen(mp);
+                /* mp must be data_path itself or a strict ancestor path. */
+                if (mp_len > dp_len)
+                        continue;
+                if (strncmp(mp, data_path, mp_len) != 0)
+                        continue;
+                /* Disallow false prefix matches (e.g., "/foo" vs "/foobar"); the
+                 * char in data_path right after mp must be '/' or end-of-string,
+                 * unless mp is "/" itself. */
+                if (mp_len > 1 && mp_len < dp_len && data_path[mp_len] != '/')
+                        continue;
+
+                if (mp_len > best_mp_len) {
+                        free(best_src);
+                        best_src = strdup(src);
+                        if (best_src == NULL)
+                                err(EXIT_FAILURE, "strdup");
+                        best_mp_len = mp_len;
+                }
+        }
+        free(line);
+        fclose(f);
+        return (best_src);
+}
+
+/* Returns true iff dataset is exactly parent or a child path under parent/. */
+static bool
+dataset_under(const char *dataset, const char *parent)
+{
+        size_t pl = strlen(parent);
+
+        if (strncmp(dataset, parent, pl) != 0)
+                return (false);
+        return (dataset[pl] == '\0' || dataset[pl] == '/');
+}
 
 static struct capabilities_v3 caps;
 
@@ -162,7 +228,15 @@ main(int argc, char *argv[])
         char *data_path = read_data_path();
         if (data_path == NULL)
                 errx(EXIT_FAILURE, "ENROOT_DATA_PATH is not set in %s", CONF_PATH);
-        /* TODO Task 3-4: validate the dataset is under data_path's parent dataset */
+
+        char *parent_ds = resolve_parent_dataset(data_path);
+        if (parent_ds == NULL)
+                errx(EXIT_FAILURE, "no ZFS dataset is mounted at or above %s", data_path);
+
+        if (!dataset_under(dataset, parent_ds))
+                errx(EXIT_FAILURE, "dataset %s is not under %s", dataset, parent_ds);
+
+        /* TODO Task 4: look up dataset's mountpoint property; mount(2) it */
 
         if (do_unmount) {
                 /* TODO Task 5 */
@@ -172,6 +246,7 @@ main(int argc, char *argv[])
         if (do_mount(dataset, "/tmp/zfs-mount-skeleton-stub", "zfs", 0, NULL) < 0)
                 err(EXIT_FAILURE, "mount failed");
 
+        free(parent_ds);
         free(data_path);
         return (EXIT_SUCCESS);
 }
