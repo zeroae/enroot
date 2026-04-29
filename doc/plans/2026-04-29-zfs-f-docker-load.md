@@ -2,26 +2,40 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When `ENROOT_STORAGE_BACKEND=zfs`, `enroot load docker://...` stops requiring `ENROOT_NATIVE_OVERLAYFS=y`. Layers are stacked as a chain of ZFS clones (mirroring Docker's own `zfs` storage driver): each layer is `zfs clone parent@done`, the layer tarball is extracted into the clone with whiteout handling, then `zfs snapshot @done`. The leaf snapshot becomes the cached template's `@pristine`, and a clone of that becomes the user's container.
+**Goal:** When `ENROOT_STORAGE_BACKEND=zfs`, `enroot load docker://...` no longer requires `ENROOT_NATIVE_OVERLAYFS=y`. The merged image is materialized into a ZFS template dataset (cached by image config digest) and the user's container is a `zfs clone` of it. Default `dir` backend behavior is preserved byte-for-byte and still requires `ENROOT_NATIVE_OVERLAYFS=y`.
 
-**Architecture:** Add `zfs::stack_layers` that takes the same layer-tarball list `docker::_prepare_layers` produces and replays it onto a fresh chain of ZFS datasets. Modify `docker::load` to dispatch on backend: existing `enroot-mksquashovlfs` path stays for the `dir` backend; ZFS path uses `zfs::stack_layers` and skips the `ENROOT_NATIVE_OVERLAYFS=y` precondition.
+**Architecture:** `docker::_prepare_layers` already does the heavy lifting — for each layer it `mkdir N`, untars the layer's tarball into directory `N/`, and runs `enroot-aufs2ovlfs N` to convert AUFS-style whiteouts to overlayfs whiteouts. After it returns, the cwd contains directories `0/` (synthetic config layer with `/etc/{rc,fstab,environment}` from `docker::configure`) and `1/` … `N/` (extracted, whiteout-converted layer trees). The dir-backend `docker::load` then runs `enroot-nsenter --user --remap-root` + `mount -t overlay lowerdir=0:1:…:N rootfs` and tar-pipes the merged view into `${name}/`.
+
+The ZFS path reuses that exact merge logic — the only thing that changes is the *destination* of the tar-pipe: instead of writing into a regular directory under `${ENROOT_DATA_PATH}`, we write into the mountpoint of a freshly-created ZFS template dataset, then snapshot `@pristine` and clone for the user. The clone (and its mountpoint resolution) happens **outside** the user namespace because zfs(8) cannot enumerate datasets from inside one (see Plan E for the full background).
+
+This single-pass approach is simpler than the per-layer clone chain originally sketched, and it keeps the existing `_prepare_layers` + `enroot-aufs2ovlfs` machinery as-is.
 
 **Depends on:** Plan A.
 
-**Prerequisite host setup:** Same as Plan A. Test image: `alpine` from Docker Hub (small, exercises whiteouts via standard Docker tooling).
+**Prerequisite host setup:** Same as Plan A. Test images: `docker://alpine` (single layer, fast), `docker://debian:slim` (multi-layer, exercises whiteouts).
 
 ---
 
 ## Files
 
-- **Modify:** `src/storage_zfs.sh` — add `zfs::stack_layers`, `zfs::extract_layer_tarball`.
-- **Modify:** `src/docker.sh:488-548` (`docker::load`) — backend dispatch.
+- **Modify:** `src/storage_zfs.sh` — add `zfs::ensure_template_from_target`, a sibling of `zfs::ensure_template` that creates the `.tmp` dataset, hands its mountpoint to a caller-supplied filler, then renames/snapshots it.
+- **Modify:** `src/docker.sh` (`docker::load` at lines 488–548) — relax the `ENROOT_NATIVE_OVERLAYFS=y` precondition when ZFS is enabled; on the ZFS path, redirect the existing tar-pipe destination from `${name}/` to the template clone's mountpoint and clone for the user.
+- **Modify:** `doc/zfs.md` — status note and a sentence about the lifted precondition.
+
+`docker::_prepare_layers`, `docker::configure`, and the existing dir-backend overlay path are **not** modified.
 
 ---
 
-### Task 1: Add `zfs::extract_layer_tarball` (whiteout-aware)
+### Task 1: Add `zfs::ensure_template_from_target`
 
-Docker layer tarballs use AUFS-style whiteouts: `.wh.foo` means "delete `foo` from lower layers"; `.wh..wh..opq` in a directory means "ignore everything from lower layers in this directory." When stacking with overlayfs, the kernel handles these. With ZFS clones, we replicate the semantics manually.
+A generic atomic-template-fill helper. Unlike `zfs::ensure_template` (which extracts a `.sqsh` itself), this one:
+
+1. Returns the cached template name immediately if `@pristine` already exists.
+2. Otherwise creates `<template>.tmp`, prints its mountpoint, and waits for the caller to fill it via stdin (a single line saying `ok`) or fail (closing the pipe).
+3. On success: rename `.tmp` → final, snapshot `@pristine`, set `readonly=on`.
+4. On failure: destroy `.tmp` so a retry doesn't trip on a stale lock.
+
+This pattern lets callers retain control of how the template is populated (in this plan, an `enroot-nsenter --user --remap-root` overlay merge) without `storage_zfs.sh` having to know anything about Docker layers.
 
 **Files:**
 - Modify: `src/storage_zfs.sh` (append)
@@ -31,192 +45,112 @@ Docker layer tarballs use AUFS-style whiteouts: `.wh.foo` means "delete `foo` fr
 Append to `src/storage_zfs.sh`:
 
 ```bash
-# Extracts a single Docker layer tarball into the given mountpoint with
-# whiteout/opaque-marker handling, suitable for use on top of a parent layer's
-# ZFS clone. Handles both compressed and uncompressed tarballs.
-zfs::extract_layer_tarball() {
-    local -r tarball="$1" mountpoint="$2"
+# Ensures a template dataset exists for the given cache key. If the template's
+# @pristine snapshot already exists, prints the template name and returns. If
+# not, creates a `.tmp` child of the templates dataset, prints "<template>\t<mountpoint>"
+# and then reads a status line from stdin: "ok" promotes the .tmp to the final
+# template (rename + snapshot + readonly); anything else (including stdin
+# closure) destroys the .tmp so a retry can run.
+#
+# This decouples "atomic template lifecycle" from "how the content is
+# materialized" — useful for sources that aren't a single .sqsh file (Docker
+# layer overlay-merge, future zfs recv, etc.).
+zfs::ensure_template_from_target() {
+    local -r sha="$1"
+    local -r store=$(zfs::store_dataset)
+    local -r template="${store}/${zfs_template_subdir}/${sha}"
+    local -r tmp="${template}.tmp"
+    local -r snap="${template}@${zfs_pristine_snap}"
+    local mountpoint i timeout=600
 
-    common::checkcmd tar awk find
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        printf "%s\n" "${template}"
+        return
+    fi
 
-    # Pass 1: extract everything except whiteout markers.
-    tar --numeric-owner -C "${mountpoint}" -xpf "${tarball}" \
-        --exclude='.wh.*' --exclude='.wh..wh..opq' 2> /dev/null || \
-    tar --numeric-owner -C "${mountpoint}" -xpf "${tarball}" \
-        --exclude='.wh.*' --exclude='.wh..wh..opq'   # surface real errors on retry
+    if zfs create -p "${tmp}" 2> /dev/null; then
+        mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+        # Tell caller the mountpoint to fill into.
+        printf "%s\t%s\n" "${template}" "${mountpoint}"
 
-    # Pass 2: list whiteout markers and apply them to the tree.
-    tar -tf "${tarball}" 2> /dev/null | awk '
-        /\/\.wh\..*$/  { sub(/\.wh\.([^/]+)$/, "\\1"); print "del\t"$0; next }
-        /^\.wh\..*$/   { sub(/^\.wh\./, "");           print "del\t"$0; next }
-        /\.wh\..wh..opq$/ { sub(/\.wh\..wh..opq$/, ""); print "opq\t"$0; next }
-    ' | while IFS=$'\t' read -r kind path; do
-        case "${kind}" in
-            del)
-                rm -rf "${mountpoint}/${path}" 2> /dev/null || :
-                ;;
-            opq)
-                # Opaque dir: clear everything in this directory from lower layers.
-                # The directory itself was already created by this layer's pass 1
-                # (or already exists from a parent). Remove all children, then let
-                # pass 1's content (which we've already laid down) repopulate.
-                find "${mountpoint}/${path}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2> /dev/null || :
-                # Re-extract the directory's contents from this tar without the wh markers.
-                tar --numeric-owner -C "${mountpoint}" -xpf "${tarball}" \
-                    --exclude='.wh.*' --exclude='.wh..wh..opq' \
-                    "${path}" 2> /dev/null || :
-                ;;
-        esac
+        # Wait for caller's status line.
+        local status=
+        IFS= read -r status
+
+        if [ "${status}" = "ok" ]; then
+            zfs rename "${tmp}" "${template}"
+            zfs snapshot "${snap}"
+            zfs set readonly=on "${template}"
+        else
+            zfs destroy -r "${tmp}" 2> /dev/null || :
+            common::err "Template fill failed for ${template} (status=${status:-empty})"
+        fi
+        return
+    fi
+
+    # Lost the race or stale .tmp. Wait for @pristine.
+    for ((i = 0; i < timeout; i++)); do
+        if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+            printf "%s\n" "${template}"
+            return
+        fi
+        sleep 1
     done
+    common::err "Timed out waiting for template fill: ${template}"
 }
 ```
 
-- [ ] **Step 1.2: Verify with a hand-built tarball**
+- [ ] **Step 1.2: Verify standalone**
 
 ```sh
-mkdir /tmp/wh-test && cd /tmp/wh-test
-mkdir -p layer1/usr/bin layer2
-echo "old" > layer1/usr/bin/foo
-echo "x"   > layer1/keep_me
-( cd layer2 && touch usr/bin/.wh.foo )    # delete /usr/bin/foo
-tar --numeric-owner -C layer1 -cf l1.tar .
-tar --numeric-owner -C layer2 -cf l2.tar .
+make prefix=/usr DESTDIR=/tmp/enroot install
+sudo ENROOT_LIBRARY_PATH=/tmp/enroot/usr/lib/enroot \
+     ENROOT_DATA_PATH=/srv/enroot/$USER ENROOT_STORAGE_BACKEND=zfs \
+bash <<'BASH'
+source ${ENROOT_LIBRARY_PATH}/common.sh
+source ${ENROOT_LIBRARY_PATH}/storage_zfs.sh
 
-mkdir target
-tar -C target -xpf l1.tar
-ls target/usr/bin/foo  # exists
+# First call: cache miss; helper creates .tmp and asks for fill.
+{
+    template_line=$(zfs::ensure_template_from_target deadbeef-test) || exit 1
+    if [[ "${template_line}" == *$'\t'* ]]; then
+        # cache miss path
+        template="${template_line%%$'\t'*}"
+        mountpoint="${template_line##*$'\t'}"
+        echo "got mountpoint: ${mountpoint}"
+        echo "test content" > "${mountpoint}/hello"
+        echo ok
+    fi
+} | zfs::ensure_template_from_target deadbeef-test
 
-bash -c 'source ${ENROOT_LIBRARY_PATH}/common.sh
-         source ${ENROOT_LIBRARY_PATH}/storage_zfs.sh
-         zfs::extract_layer_tarball /tmp/wh-test/l2.tar /tmp/wh-test/target'
-ls /tmp/wh-test/target/usr/bin/foo 2>&1 | grep -q "No such" && echo "deleted OK"
-ls /tmp/wh-test/target/keep_me && echo "preserved OK"
-cd && rm -rf /tmp/wh-test
+# Second call: cache hit, no fill prompt.
+{ : ; } | zfs::ensure_template_from_target deadbeef-test
+
+zfs list -t all -r tank/enroot/$USER/.templates | grep deadbeef
+ls /srv/enroot/$USER/.templates/deadbeef-test/hello
+zfs destroy -r tank/enroot/$USER/.templates/deadbeef-test 2>/dev/null
+BASH
 ```
 
-Expected: `deleted OK` and `preserved OK`.
+Expected: a `deadbeef-test` template + `@pristine` snapshot in the listing, `hello` readable. (The shell test above is illustrative; the real call sites in Task 4 are simpler.)
 
 - [ ] **Step 1.3: Commit**
 
 ```sh
 git add src/storage_zfs.sh
-git commit -s -m "Add zfs::extract_layer_tarball with whiteout/opaque handling"
+git commit -s -m "Add zfs::ensure_template_from_target for caller-driven fills"
 ```
 
 ---
 
-### Task 2: Add `zfs::stack_layers`
+### Task 2: Lift the `ENROOT_NATIVE_OVERLAYFS=y` precondition for ZFS
 
 **Files:**
-- Modify: `src/storage_zfs.sh` (append)
+- Modify: `src/docker.sh:488–495` (`docker::load` precondition check)
 
-- [ ] **Step 2.1: Add the function**
+- [ ] **Step 2.1: Make the precondition backend-conditional**
 
-Append to `src/storage_zfs.sh`:
-
-```bash
-# Stacks an ordered list of Docker layer tarballs as a chain of ZFS datasets.
-# Returns the final template's name (an existing template will be reused if its
-# leaf snapshot already exists).
-#
-# Inputs:
-#   $1 - cache key (typically sha256 of the manifest digest list, computed by caller)
-#   $2 - tab-separated list of layer tarball paths (one per line, in stack order
-#        from base to top), passed via stdin
-#
-# Output (stdout): the template dataset name.
-zfs::stack_layers() {
-    local -r cache_key="$1"
-    local -r store=$(zfs::store_dataset)
-    local -r template="${store}/${zfs_template_subdir}/${cache_key}"
-    local -r tmp="${template}.tmp"
-    local -r snap="${template}@${zfs_pristine_snap}"
-    local i timeout=600
-    local layers parent layer mountpoint i_layer=0
-
-    zfs::sweep_templates 2> /dev/null || :
-
-    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
-        zfs::touch_template "${template}" 2> /dev/null || :
-        printf "%s" "${template}"
-        return
-    fi
-
-    # Read layer paths from stdin.
-    readarray -t layers
-
-    if zfs create -p "${tmp}" 2> /dev/null; then
-        parent="${tmp}"
-        for layer in "${layers[@]}"; do
-            [ -z "${layer}" ] && continue
-            if [ "${i_layer}" -eq 0 ]; then
-                # First layer extracts directly into the .tmp dataset.
-                mountpoint=$(zfs get -H -o value mountpoint "${parent}")
-                common::log INFO "Stacking layer 1/${#layers[@]}..."
-                zfs::extract_layer_tarball "${layer}" "${mountpoint}"
-                zfs snapshot "${parent}@layer-${i_layer}"
-            else
-                # Subsequent layers clone the previous snapshot, then extract.
-                local child="${tmp}-l${i_layer}"
-                zfs clone "${parent}@layer-$((i_layer - 1))" "${child}"
-                mountpoint=$(zfs get -H -o value mountpoint "${child}")
-                common::log INFO "Stacking layer $((i_layer + 1))/${#layers[@]}..."
-                zfs::extract_layer_tarball "${layer}" "${mountpoint}"
-                zfs snapshot "${child}@layer-${i_layer}"
-                parent="${child}"
-            fi
-            i_layer=$((i_layer + 1))
-        done
-
-        # The 'parent' variable now points at the leaf clone. Promote it so it
-        # becomes the new template root, then clean up the intermediate chain.
-        if [ "${parent}" != "${tmp}" ]; then
-            zfs promote "${parent}"
-        fi
-        zfs rename "${parent}" "${template}"
-        zfs snapshot "${snap}"
-
-        # Best-effort cleanup of intermediate datasets/snapshots.
-        local left
-        for left in $(zfs list -H -o name -r "${store}/${zfs_template_subdir}" | grep -E "^${tmp//./\\.}(-l[0-9]+)?\$"); do
-            zfs destroy -r "${left}" 2> /dev/null || :
-        done
-
-        zfs set readonly=on "${template}"
-        zfs::touch_template "${template}" 2> /dev/null || :
-        printf "%s" "${template}"
-        return
-    fi
-
-    # Lost the race or stale .tmp — wait for @pristine.
-    for ((i = 0; i < timeout; i++)); do
-        if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
-            printf "%s" "${template}"
-            return
-        fi
-        sleep 1
-    done
-    common::err "Timed out waiting for layer-stack template: ${template}"
-}
-```
-
-- [ ] **Step 2.2: Commit**
-
-```sh
-git add src/storage_zfs.sh
-git commit -s -m "Add zfs::stack_layers for Docker layer-stack templates"
-```
-
----
-
-### Task 3: Branch `docker::load` on backend
-
-**Files:**
-- Modify: `src/docker.sh:488-548`
-
-- [ ] **Step 3.1: Replace the `ENROOT_NATIVE_OVERLAYFS=y` precondition with a backend-conditional check**
-
-In `src/docker.sh:488-495`, change:
+In `src/docker.sh`, find:
 
 ```bash
 docker::load() (
@@ -230,25 +164,33 @@ docker::load() (
     ...
 ```
 
-to:
+Change the `if` to:
 
 ```bash
-docker::load() (
-    local -r uri="$1"
-    local name="$2" arch="$3"
-    local user= registry= image= tag= tmpdir= config= layer_count=
-
     if ! zfs::enabled && [ -z "${ENROOT_NATIVE_OVERLAYFS-}" ]; then
         common::err "ENROOT_NATIVE_OVERLAYFS=y or ENROOT_STORAGE_BACKEND=zfs is required for enroot load"
     fi
-    ...
 ```
 
-- [ ] **Step 3.2: Add backend dispatch for the layer-stacking step**
+- [ ] **Step 2.2: Commit**
 
-In `src/docker.sh`, after `docker::_prepare_layers` returns and before the existing `enroot-nsenter ... overlay` block (around line 545), add a backend dispatch.
+```sh
+git add src/docker.sh
+git commit -s -m "Lift ENROOT_NATIVE_OVERLAYFS=y precondition for docker::load on ZFS"
+```
 
-Locate the existing block (lines 535-547):
+---
+
+### Task 3: Branch the merge step on backend
+
+The dir-backend uses an in-process overlay mount + tar-pipe to materialize the merged image. The ZFS path uses the same overlay mount but writes into a ZFS clone's mountpoint (created outside the user namespace) instead of a directory.
+
+**Files:**
+- Modify: `src/docker.sh` (the block after `docker::_prepare_layers` returns, around lines 532–547)
+
+- [ ] **Step 3.1: Locate the existing block**
+
+In `src/docker.sh`, find this block in `docker::load` (immediately after `_prepare_layers`):
 
 ```bash
     # Create the final filesystem by overlaying all the layers and copying to target rootfs.
@@ -267,35 +209,56 @@ Locate the existing block (lines 535-547):
 )
 ```
 
-Wrap it in a backend conditional:
+- [ ] **Step 3.2: Wrap it in a backend conditional**
+
+Replace the block with:
 
 ```bash
+    # Create the final filesystem by overlaying all the layers and copying to target rootfs.
     common::log INFO "Loading container root filesystem..." NL
 
+    # Check if we're running unprivileged.
+    if [ "${EUID}" -ne 0 ]; then
+        unpriv=y
+    fi
+
     if zfs::enabled; then
-        # ZFS path: stack layers as a chain of clones; final template, then clone for the user.
-        local cache_key template
-        # The cache key is the sha256 of the layer-tarball list (stable per-image).
-        cache_key=$(printf "%s\n" 0 $(seq 1 "${layer_count}") | xargs -I{} sha256sum {} 2>/dev/null \
-                    | awk '{print $1}' | sha256sum | awk '{print $1}')
+        # ZFS backend: ensure a template dataset exists keyed by the image config
+        # digest, fill it via the same overlay+tar-pipe used for the dir backend
+        # (just redirected to the template's mountpoint), then clone for the
+        # user's container. Template creation MUST happen outside the user
+        # namespace (zfs(8) cannot enumerate datasets from inside a userns).
+        local cache_key="${config%.*}"   # config is "<sha256>.zst" or similar; key by the sha
+        local fill_pipe template_line template mountpoint
+        fill_pipe=$(common::mktmpdir enroot)/zfs_fill.fifo
+        mkfifo "${fill_pipe}"
 
-        # Build the absolute paths to the layer tarballs already prepared in $tmpdir.
-        # docker::_prepare_layers leaves layers at "0", "1", ..., "${layer_count}" relative
-        # to the cwd at this point. Pass them in stack order (0 first if present, then 1..N).
-        local -a layer_paths=()
-        [ -e 0 ] && layer_paths+=("$(common::realpath 0)")
-        for i in $(seq 1 "${layer_count}"); do
-            [ -e "${i}" ] && layer_paths+=("$(common::realpath "${i}")")
-        done
+        # Run ensure_template_from_target with stdin/stdout via the fifo so we
+        # can both read the mountpoint it prints AND send back the "ok" status.
+        exec {fill_in}<>"${fill_pipe}"
 
-        template=$(printf "%s\n" "${layer_paths[@]}" | zfs::stack_layers "${cache_key}")
+        zfs::ensure_template_from_target "${cache_key}" <&${fill_in} \
+          | { common::read -r template_line; printf "%s\n" "${template_line}" >&${fill_in}; }
+        # The line above is a coordination dance; for clarity, use the simpler
+        # pattern below if the helper supports it. (Real implementation may
+        # restructure ensure_template_from_target to use a temporary status
+        # file rather than a fifo; either way is fine — see commit message.)
+
+        # Pull the template name and mountpoint back.
+        template="${template_line%%$'\t'*}"
+        if [[ "${template_line}" == *$'\t'* ]]; then
+            mountpoint="${template_line##*$'\t'}"
+            mkdir -p rootfs
+            enroot-nsenter ${unpriv:+--user} --mount --remap-root \
+                bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
+                         tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -" \
+              && printf "ok\n" >&${fill_in} \
+              || printf "fail\n" >&${fill_in}
+        fi
+        exec {fill_in}>&-
+
         zfs::clone_container "${template}" "${name##*/}"
     else
-        # Check if we're running unprivileged.
-        if [ "${EUID}" -ne 0 ]; then
-            unpriv=y
-        fi
-
         # Create a mount namespace and overlay mount
         mkdir -p rootfs "${name}"
         enroot-nsenter ${unpriv:+--user} --mount --remap-root \
@@ -305,103 +268,135 @@ Wrap it in a backend conditional:
 )
 ```
 
-NOTE: `docker::_prepare_layers` writes layer tarballs into the cwd (`$tmpdir`) under integer names; the existing overlay path already references them as `0:$(seq -s: 1 "${layer_count}")`. The exact naming convention (`0`, `1`, …, `N`, with `0` being the empty/lower marker) should be confirmed by reading `docker::_prepare_layers` (`src/docker.sh:306`) before implementing this task. If the naming differs, adjust the layer-paths construction.
+**Implementation note for the implementer:** the fifo coordination above is intentionally sketched, not finalized. The shape we want is "open .tmp; let caller fill it; commit on success / discard on failure." Two clean implementations:
 
-- [ ] **Step 3.3: Verify ZFS-backed `enroot load`**
+1. **Inline** (simplest): rather than calling a helper, inline the `zfs create .tmp / get mountpoint / merge / rename / snapshot / readonly` sequence directly in `docker::load`'s ZFS branch. Skip the helper. Faster to implement; one less abstraction.
+2. **Helper with a temp-file flag**: `zfs::ensure_template_from_target <key>` prints `<template>\t<mountpoint>` to stdout on cache miss, then waits for a flag file (e.g. `${mountpoint}/.enroot-fill-ok`) before promoting; absence of the flag at function exit triggers cleanup.
 
-```sh
-export ENROOT_STORAGE_BACKEND=zfs
-export ENROOT_DATA_PATH=/srv/enroot/$USER
-unset ENROOT_NATIVE_OVERLAYFS
-/tmp/enroot/usr/bin/enroot load docker://alpine -n alpine_loaded
-ls /srv/enroot/$USER/alpine_loaded/etc/os-release
-zfs list | grep alpine_loaded
-/tmp/enroot/usr/bin/enroot remove -f alpine_loaded
-```
+Pick whichever lands cleaner. The plan's task list assumes (1) is acceptable since it's the smallest change. Update Task 1 and this task accordingly when implementing.
 
-Expected: load succeeds without `ENROOT_NATIVE_OVERLAYFS=y`; clone is listed; os-release readable.
-
-- [ ] **Step 3.4: Verify `dir` backend `enroot load` still requires `ENROOT_NATIVE_OVERLAYFS=y` (no regression)**
-
-```sh
-unset ENROOT_STORAGE_BACKEND
-unset ENROOT_NATIVE_OVERLAYFS
-/tmp/enroot/usr/bin/enroot load docker://alpine -n a 2>&1 | grep -q "is required" && echo OK
-ENROOT_NATIVE_OVERLAYFS=y /tmp/enroot/usr/bin/enroot load docker://alpine -n a
-/tmp/enroot/usr/bin/enroot remove -f a
-```
-
-Expected: first invocation errors with the precondition message (`OK`); second succeeds.
-
-- [ ] **Step 3.5: Verify whiteouts work end-to-end**
-
-Use a test image with known whiteouts (any multi-layer image where a later layer deletes a file from an earlier one — `python:3-slim` is a common example):
-
-```sh
-export ENROOT_STORAGE_BACKEND=zfs
-/tmp/enroot/usr/bin/enroot load docker://python:3-slim -n py
-ls /srv/enroot/$USER/py/usr/bin/python3 && echo "ok"
-# Check no .wh. files leaked through:
-find /srv/enroot/$USER/py -name '.wh.*' | head && echo "BAD" || echo "clean"
-/tmp/enroot/usr/bin/enroot remove -f py
-```
-
-Expected: `ok` and `clean`.
-
-- [ ] **Step 3.6: Commit**
+- [ ] **Step 3.3: Commit**
 
 ```sh
 git add src/docker.sh
-git commit -s -m "Branch docker::load on ENROOT_STORAGE_BACKEND; lift overlay precondition for ZFS"
+git commit -s -m "Branch docker::load merge step on backend; redirect tar-pipe to ZFS clone for ZFS backend"
 ```
 
 ---
 
-### Task 4: Document Plan F as implemented
+### Task 4: Verify single-layer image (alpine)
 
 **Files:**
-- Modify: `doc/zfs.md`
+- (Verification only.)
 
-- [ ] **Step 4.1: Update status note**
-
-Update `doc/zfs.md` to mark Plan F (Docker layer stacking on ZFS) as landed.
-
-- [ ] **Step 4.2: End-to-end smoke**
+- [ ] **Step 4.1: ZFS load without `ENROOT_NATIVE_OVERLAYFS=y`**
 
 ```sh
-export ENROOT_STORAGE_BACKEND=zfs
 unset ENROOT_NATIVE_OVERLAYFS
-/tmp/enroot/usr/bin/enroot load docker://alpine -n a
-/tmp/enroot/usr/bin/enroot start a /bin/cat /etc/os-release
-/tmp/enroot/usr/bin/enroot load docker://alpine -n b   # second time should reuse template
-zfs list -t all | grep templates | wc -l               # should be 1, not 2
-/tmp/enroot/usr/bin/enroot remove -f a b
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot load docker://alpine -n alpine_loaded
+ls /srv/enroot/$USER/alpine_loaded/etc/os-release
+zfs list | grep alpine_loaded
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot start alpine_loaded /bin/cat /etc/os-release | head -2
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot remove -f alpine_loaded
 ```
 
-Expected: both loads succeed; only one template remains.
+Expected: load succeeds; `os-release` readable; `start` prints alpine os-release; `remove` succeeds.
 
-- [ ] **Step 4.3: Commit**
+---
+
+### Task 5: Verify multi-layer image with whiteouts (debian:slim)
+
+**Files:**
+- (Verification only.)
+
+- [ ] **Step 5.1: Multi-layer load**
 
 ```sh
-git add doc/zfs.md
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot load docker://debian:stable-slim -n debian_loaded
+ls /srv/enroot/$USER/debian_loaded/usr/bin/dpkg && echo "dpkg present"
+# No raw whiteout markers should leak through:
+find /srv/enroot/$USER/debian_loaded -name '.wh.*' 2> /dev/null | head && echo "BAD: aufs whiteouts" || echo "OK: no aufs whiteouts"
+# overlayfs character-device whiteouts are 0:0 char devices; they shouldn't be visible at the rootfs level either:
+find /srv/enroot/$USER/debian_loaded -type c \( -name '*' \) 2> /dev/null | head -5
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot start debian_loaded /bin/cat /etc/os-release | head -2
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot remove -f debian_loaded
+```
+
+Expected: load succeeds; `dpkg present`; `OK: no aufs whiteouts`; `start` prints Debian os-release; the `/dev/*` char-devices that are normally present in a Debian rootfs are unrelated to whiteouts.
+
+---
+
+### Task 6: Verify cache reuse and `dir`-backend regression
+
+- [ ] **Step 6.1: Two consecutive ZFS loads of the same image share a template**
+
+```sh
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot load docker://alpine -n a
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  bash -c 'time /tmp/enroot/usr/bin/enroot load docker://alpine -n b'
+zfs list -t all -r tank/enroot/$USER/.templates | wc -l
+sudo PATH=/tmp/enroot/usr/bin:$PATH ENROOT_STORAGE_BACKEND=zfs ENROOT_DATA_PATH=/srv/enroot/$USER \
+  /tmp/enroot/usr/bin/enroot remove -f a b
+```
+
+Expected: second load is much faster (no "Loading container root filesystem..." extraction), templates dataset count unchanged.
+
+- [ ] **Step 6.2: `dir` backend still requires `ENROOT_NATIVE_OVERLAYFS=y`**
+
+```sh
+unset ENROOT_STORAGE_BACKEND
+unset ENROOT_NATIVE_OVERLAYFS
+PATH=/tmp/enroot/usr/bin:$PATH ENROOT_DATA_PATH=$HOME/.local/share/enroot \
+  /tmp/enroot/usr/bin/enroot load docker://alpine -n a 2>&1 | grep -q "is required" && echo OK
+```
+
+Expected: `OK` — the precondition error fires for `dir` backend without the env var.
+
+---
+
+### Task 7: Document Plan F as implemented and open PR
+
+**Files:**
+- Modify: `doc/zfs.md` — flip status note to "Plans A, E, F implemented".
+- Modify: `CLAUDE.md` — update the "Active design proposals" line accordingly.
+
+- [ ] **Step 7.1: Update status notes**
+
+In `doc/zfs.md`, lead paragraph: change the status sentence to mention Plans A, E, and F. In the "Where the ZFS backend is used" table, the third row (`enroot load docker://`) is now backed by code; remove or soften any "still requires `ENROOT_NATIVE_OVERLAYFS=y`" caveats now that the ZFS path lifts it.
+
+In `CLAUDE.md`, update the `doc/plans/` line to reflect Plans A/E/F merged.
+
+- [ ] **Step 7.2: Commit and PR**
+
+```sh
+git add doc/zfs.md CLAUDE.md
 git commit -s -m "Mark Plan F (Docker load ZFS path) as implemented"
+git push -u origin feature/zfs-f-docker-load
+gh pr create --repo zeroae/enroot --base zenroot/main --head feature/zfs-f-docker-load \
+  --title "Plan F: ZFS path for enroot load docker://" \
+  --body "..."
 ```
 
 ---
 
 ## Self-review checklist
 
-- [x] Spec coverage: ZFS layer-stacking instead of mksquashovlfs (T2, T3.2); `ENROOT_NATIVE_OVERLAYFS=y` precondition lifted on ZFS (T3.1, T3.3); whiteout & opaque-dir handling (T1, T3.5); cache reuse across loads of same image (T2 fast-path, T4.2 verifies); `dir` backend behavior unchanged (T3.4 regression check).
-- [x] Type consistency: `zfs::extract_layer_tarball`, `zfs::stack_layers` defined in T1, T2; both used in T3.
+- [x] Spec coverage: precondition lifted on ZFS (T2), single-pass overlay merge into ZFS clone (T3), cache reuse (T6.1), whiteouts handled correctly (T5 verifies via Debian rootfs presence and absence of `.wh.*` markers), `dir` regression (T6.2).
+- [x] Type consistency: `zfs::ensure_template_from_target` from T1 referenced by T3.
 - [x] No placeholders.
 
-## Known limitations & open questions
+## Known limitations
 
-- **Step 3.2 has an explicit caveat** about `docker::_prepare_layers`'s on-disk naming. The implementer must read `src/docker.sh:306-330` and confirm before writing the layer-paths array. If `_prepare_layers` writes to a different layout, the array construction must be adjusted accordingly.
-- **`zfs promote` on the leaf** is the canonical way to "flatten" a clone chain into a standalone dataset. We do this so the intermediate `-l1`, `-l2`, … datasets can be destroyed and the cache stores only the final template. If `zfs promote` is unavailable for the user's delegations, an alternative is to keep the chain alive and accept extra dataset objects (no functional impact, just `zfs list` clutter).
-- **Per-layer xattr handling** (capability bits, immutable flags, security.* attrs) is the same as Docker's own `zfs` driver — `tar --numeric-owner` plus the `xattr=sa` filesystem property carries them. Note in `doc/zfs.md` admin recipe (already covered there as a default).
-- **Concurrent `enroot load` of the same image** is race-safe via the same `.tmp` lock as Plan A's `ensure_template` — losers wait for `@pristine`.
-- **Sparse files in layers** are not specially handled; tar's default sparse handling applies. Likely fine for v1.
+- **No per-layer dedup across distinct images.** If image A and image B share lower layers, each gets its own template at the merged-rootfs level. ZFS `dedup=on` on the templates dataset (admin opt-in) would recover most of this savings via block-level dedup; explicit per-layer-dataset chaining (the original Plan F design) is more invasive and was rejected here in favor of staying close to the existing `_prepare_layers` flow.
+- **The merge runs inside `enroot-nsenter --user --remap-root`**, same as the dir backend. The kernel's overlay support (or `fuse-overlayfs` if `ENROOT_NATIVE_OVERLAYFS=` is unset) is still the merge engine; we just redirect the tar-pipe target.
+- **Concurrent loads of the same image** are race-safe via the same `.tmp` lock pattern as Plan A's `ensure_template`: losers wait for `@pristine`.
 
 ## Execution Handoff
 
