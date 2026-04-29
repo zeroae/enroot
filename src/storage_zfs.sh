@@ -50,6 +50,29 @@ zfs::touch_template() {
     zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
 }
 
+# Prints "<dataset>\t<last_used_epoch>" for each evictable template, sorted
+# oldest-first. A template is evictable iff it has @pristine and that snapshot
+# has no clones referencing it. Datasets without a last_used property report
+# "-"; the sweep treats these as cold (effectively age = +infinity).
+zfs::eviction_candidates() {
+    local -r store=$(zfs::store_dataset)
+    local -r templates_dataset="${store}/${zfs_template_subdir}"
+    local ds ts clones
+
+    # Bail if the templates parent doesn't exist yet.
+    zfs list -H "${templates_dataset}" > /dev/null 2>&1 || return 0
+
+    # Direct children only (-d 1, exclude self via $1 != ds-parent).
+    while IFS=$'\t' read -r ds ts; do
+        [ "${ds}" = "${templates_dataset}" ] && continue
+        clones=$(zfs get -H -o value clones "${ds}@${zfs_pristine_snap}" 2> /dev/null) || continue
+        if [ -z "${clones}" ] || [ "${clones}" = "-" ]; then
+            printf "%s\t%s\n" "${ds}" "${ts:--}"
+        fi
+    done < <(zfs list -H -r -d 1 -t filesystem -o name,enroot:last_used "${templates_dataset}") \
+      | sort -t $'\t' -k2,2n
+}
+
 # Computes the sha256 of a squashfs image file. Used as the template cache key.
 zfs::image_sha256() {
     local -r image="$1"
