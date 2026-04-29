@@ -580,6 +580,8 @@ zfs::send_stream() {
 #   $2 layer_count - the N from _prepare_layers (count of layer directories)
 #   $3 unpriv      - "y" or "" — whether to enter a new user namespace
 #
+# Outputs: prints the template dataset path to stdout (no trailing newline).
+#
 # Atomicity: races on the same cache_key are resolved via a per-key .tmp
 # dataset lock; losers wait for @pristine. ENOSPC mid-merge destroys the
 # .tmp so a retry can run.
