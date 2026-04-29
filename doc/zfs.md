@@ -1,6 +1,6 @@
 # ZFS storage backend
 
-This document describes an optional ZFS-aware mode for the enroot container store. **Plan A (foundation) is implemented**: `enroot create` and `enroot remove` use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI, ephemeral-start ZFS path, Docker layer stacking on ZFS) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
+This document describes an optional ZFS-aware mode for the enroot container store. **Plans A (foundation) and E (ephemeral start) are implemented**: `enroot create`, `enroot remove`, and ephemeral `enroot start <image>` all use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI, Docker layer stacking on ZFS) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
 
 ## Motivation
 
@@ -205,6 +205,8 @@ A site enabling the ZFS backend should:
    - **`fs.namespace.unprivileged_userns_clone=1` + per-user mount namespace.** A wrapper that enters a user namespace before `enroot create` lets the ZFS auto-mount succeed without root, at the cost of complexity and a small overhead.
 
    On hosts where the same operator runs `create` and `start`, the privileged-create approach is simpler and matches enroot's existing model where image conversion (`enroot import`/`enroot-aufs2ovlfs`) already requires elevated privileges.
+
+   **Linux user-namespace caveat:** `zfs list` cannot enumerate datasets from inside a Linux user namespace — even when their mount entries are visible — so any ZFS work must happen *before* `enroot-nsenter --user`. For ephemeral `enroot start <image>` (Plan E), the ephemeral clone is created in `runtime::start` outside the namespace, with a shell trap that destroys it on the parent process's exit. Implementation-internal, but worth knowing if you debug.
 
 4. **Configure `ENROOT_STORAGE_BACKEND=zfs`** in `enroot.conf` (or per-user). Set `ENROOT_DATA_PATH` to the mountpoint of `tank/enroot` (or per-user subdataset).
 
