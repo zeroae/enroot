@@ -199,12 +199,22 @@ A site enabling the ZFS backend should:
 
    `zfs receive` from `.zfs` files and `zfs://` requires this delegation. Without it, the ZFS backend operates only on already-received templates.
 
-   **Linux mount(2) caveat:** ZFS delegation governs ZFS's *internal* logic, but on Linux the kernel `mount(2)` syscall still requires `CAP_SYS_ADMIN`. As a result, an unprivileged user invoking `enroot create` on the ZFS backend will see "filesystem successfully created, but it may only be mounted by root" warnings, and the dataset will not be auto-mounted. The two practical workarounds:
+   **Linux mount(2) bypass via `enroot-zfs-mount`:** ZFS delegation governs
+   ZFS's *internal* logic, but on Linux the kernel `mount(2)` syscall still
+   requires `CAP_SYS_ADMIN`. The `enroot+caps` package installs
+   `enroot-zfs-mount` with `cap_sys_admin+pe`; the helper validates that the
+   caller-supplied dataset is under the parent dataset of `ENROOT_DATA_PATH`
+   (read from `/etc/enroot/enroot.conf`, NOT from user-controlled config),
+   that its `mountpoint` property is under `ENROOT_DATA_PATH`, and that it
+   isn't already mounted, before performing `mount(2)` / `umount2(2)`. With
+   `+caps` installed, all unprivileged ZFS-backed flows (`enroot create`,
+   `enroot load`, `enroot start <image>`, `enroot remove`) work end-to-end —
+   including from inside `slurmstepd` post-privilege-drop, which is what
+   pyxis needs.
 
-   - **Privileged `create`, unprivileged everything else.** Run `enroot create` (and `enroot load`) as root or via sudo; `enroot start`, `exec`, and `remove` work unprivileged because they operate on already-mounted datasets or use mount-namespace tricks that don't need additional CAP_SYS_ADMIN.
-   - **`fs.namespace.unprivileged_userns_clone=1` + per-user mount namespace.** A wrapper that enters a user namespace before `enroot create` lets the ZFS auto-mount succeed without root, at the cost of complexity and a small overhead.
-
-   On hosts where the same operator runs `create` and `start`, the privileged-create approach is simpler and matches enroot's existing model where image conversion (`enroot import`/`enroot-aufs2ovlfs`) already requires elevated privileges.
+   Without `+caps`, unprivileged callers cannot mount ZFS datasets and must
+   run `enroot create` and friends as root (e.g., via sudo or a
+   privilege-elevated systemd unit). The `dir` backend is unaffected.
 
    **Linux user-namespace caveat:** `zfs list` cannot enumerate datasets from inside a Linux user namespace — even when their mount entries are visible — so any ZFS work must happen *before* `enroot-nsenter --user`. For ephemeral `enroot start <image>` (Plan E), the ephemeral clone is created in `runtime::start` outside the namespace; cleanup is handled by a small "zfs-eph-shim" subshell that mirrors the existing `runtime::_mount_rootfs_shim` pattern — forked into its own process group, parked with `SIGSTOP`, and triggered to `zfs destroy` via the kernel's orphaned-process-group `SIGHUP` rule when the container's exec chain exits. The original `exec enroot-nsenter ...` chain is preserved, so PID semantics, signal forwarding, and `enroot exec PID` all work identically to the `dir` backend.
 
