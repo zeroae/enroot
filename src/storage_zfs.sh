@@ -50,6 +50,15 @@ zfs::touch_template() {
     zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
 }
 
+# Returns 0 iff a fully-materialized template (with @pristine snapshot) exists
+# for the given cache_key. Cheap predicate; does not run the eviction sweep.
+zfs::template_exists() {
+    local -r cache_key="$1"
+    local store
+    store=$(zfs::store_dataset)
+    zfs list -H -t snapshot "${store}/${zfs_template_subdir}/${cache_key}@${zfs_pristine_snap}" > /dev/null 2>&1
+}
+
 # Prints "<dataset>\t<last_used_epoch>" for each evictable template, sorted
 # oldest-first. A template is evictable iff it has @pristine and that snapshot
 # has no clones referencing it. Datasets without a last_used property report
