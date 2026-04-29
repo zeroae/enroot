@@ -262,6 +262,55 @@ zfs::container_check() {
     fi
 }
 
+# Parses a zfs:// URI into "host\tname". Format: zfs://host/NAME (NAME may
+# contain extra path components which are reassembled into the container name).
+zfs::parse_uri() {
+    local -r uri="$1"
+    if [[ ! "${uri}" =~ ^zfs://([^/]+)/(.+)$ ]]; then
+        common::err "Invalid zfs:// URI: ${uri}"
+    fi
+    printf "%s\t%s" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+# Sends a clone's @pristine snapshot (or a fresh snapshot if the container is
+# not a clone) to stdout. Used by --zfs-send.
+zfs::send_clone_stdout() {
+    local -r name="$1"
+    local -r store=$(zfs::store_dataset)
+    local -r target="${store}/${name}"
+    local origin
+
+    if ! zfs list -H "${target}" > /dev/null 2>&1; then
+        common::err "No such container: ${name}"
+    fi
+
+    origin=$(zfs get -H -o value origin "${target}")
+    if [ -z "${origin}" ] || [ "${origin}" = "-" ]; then
+        local snap="${target}@enroot-export-$$"
+        zfs snapshot "${snap}"
+        trap "zfs destroy '${snap}' 2> /dev/null || :" RETURN
+        zfs send "${snap}"
+    else
+        zfs send "${origin}"
+    fi
+}
+
+# Receives a zfs send stream from stdin into the template cache, then clones
+# the resulting template into a named user container. Used by --zfs-recv.
+# The cache key is the sha256 of the (buffered) stream bytes — same scheme as
+# zfs::create_from_stream uses for .zfs files.
+zfs::recv_to_template_stdin() {
+    local -r name="$1"
+    local buf sha template
+
+    buf=$(mktemp -p "${ENROOT_TEMP_PATH:-/tmp}" enroot-recv.XXXXXX)
+    trap "rm -f '${buf}' 2> /dev/null || :" RETURN
+    cat > "${buf}"
+    sha=$(zfs::image_sha256 "${buf}")
+    template=$(zfs::ensure_template_from_stream "${buf}" "${sha}")
+    zfs::clone_container "${template}" "${name}"
+}
+
 # Materializes a ZFS stream file into a template (cached by file sha) and
 # clones it as the user's named container. Counterpart of zfs::ensure_template
 # + zfs::clone_container for the .sqsh path; this is called from runtime::create
