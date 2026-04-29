@@ -449,7 +449,7 @@ runtime::create() {
             if [[ "${rootfs}" == */* ]]; then
                 common::err "Invalid argument: ${rootfs}"
             fi
-            runtime::_create_zfs_from_stream "${image}" "${rootfs}"
+            zfs::create_from_stream "${image}" "${rootfs}"
             ;;
         *)
             if ! unsquashfs -s "${image}" > /dev/null 2>&1; then
@@ -468,16 +468,6 @@ runtime::create() {
             fi
             ;;
     esac
-}
-
-runtime::_create_zfs_from_stream() {
-    local -r image="$1" rootfs_name="$2"
-    local sha template
-
-    zfs::checkenv
-    sha=$(zfs::image_sha256 "${image}")
-    template=$(zfs::ensure_template_from_stream "${image}" "${sha}")
-    zfs::clone_container "${template}" "${rootfs_name}"
 }
 
 runtime::_create_dir() {
@@ -597,7 +587,7 @@ runtime::export() {
     if [ "${format}" = "sqsh" ]; then
         runtime::_export_sqsh "${rootfs_name}" "${filename}"
     else
-        runtime::_export_zfs "${rootfs_name}" "${filename}"
+        zfs::export_to_file "${rootfs_name}" "${filename}"
     fi
 }
 
@@ -640,26 +630,6 @@ runtime::_export_sqsh() {
     common::log INFO "Creating squashfs filesystem..." NL
     mksquashfs "${rootfs}" "${filename}" -all-root ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
       ${ENROOT_SQUASH_OPTIONS} ${exclude[@]+-e "${exclude[@]}"} >&2
-}
-
-runtime::_export_zfs() {
-    local -r rootfs_name="$1"
-    local filename="$2"
-
-    if [ -z "${filename}" ]; then
-        filename="${rootfs_name}.zfs"
-    fi
-    filename=$(common::realpath "${filename}")
-    if [ -e "${filename}" ]; then
-        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
-            common::err "File already exists: ${filename}"
-        else
-            rm -f "${filename}"
-        fi
-    fi
-
-    common::log INFO "Creating zfs send stream..." NL
-    zfs::send_stream "${rootfs_name}" "${filename}"
 }
 
 runtime::list() {

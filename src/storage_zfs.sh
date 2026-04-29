@@ -262,6 +262,43 @@ zfs::container_check() {
     fi
 }
 
+# Materializes a ZFS stream file into a template (cached by file sha) and
+# clones it as the user's named container. Counterpart of zfs::ensure_template
+# + zfs::clone_container for the .sqsh path; this is called from runtime::create
+# when the input image has a .zfs extension.
+zfs::create_from_stream() {
+    local -r image="$1" name="$2"
+    local sha template
+
+    zfs::checkenv
+    sha=$(zfs::image_sha256 "${image}")
+    template=$(zfs::ensure_template_from_stream "${image}" "${sha}")
+    zfs::clone_container "${template}" "${name}"
+}
+
+# Exports a clone's @pristine snapshot as a zfs send stream file. Owns
+# filename defaulting and the file-already-exists guard so runtime::export's
+# ZFS branch is a single dispatch call.
+zfs::export_to_file() {
+    local -r name="$1"
+    local filename="$2"
+
+    if [ -z "${filename}" ]; then
+        filename="${name}.zfs"
+    fi
+    filename=$(common::realpath "${filename}")
+    if [ -e "${filename}" ]; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "File already exists: ${filename}"
+        else
+            rm -f "${filename}"
+        fi
+    fi
+
+    common::log INFO "Creating zfs send stream..." NL
+    zfs::send_stream "${name}" "${filename}"
+}
+
 # Materializes a template from a zfs send stream file. The cache key is the
 # sha256 of the stream file (same scheme as the .sqsh path). Atomic via a
 # .tmp dataset; integrates with the same eviction sweep as ensure_template.
