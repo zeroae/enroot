@@ -92,6 +92,35 @@ zfs::under_pressure() {
     [ "${pct}" -ge "${ENROOT_TEMPLATE_PRESSURE_THRESHOLD-80}" ]
 }
 
+# Sweeps evictable templates. Always reaps cold ones (last_used older than
+# ENROOT_TEMPLATE_WARM_SECONDS); also reaps warm ones LRU when under pressure,
+# stopping once back under threshold. With ENROOT_TEMPLATE_WARM_SECONDS=0 and
+# no quota, this collapses to "reap any template with no clones" (refcount-only
+# behavior, equivalent to Plan A's destroy_container).
+zfs::sweep_templates() {
+    local now warm_secs pressure ds ts age is_warm
+    now=$(date +%s)
+    warm_secs="${ENROOT_TEMPLATE_WARM_SECONDS-604800}"
+    zfs::under_pressure && pressure=y || pressure=
+
+    zfs::eviction_candidates | while IFS=$'\t' read -r ds ts; do
+        if [ -z "${ts}" ] || [ "${ts}" = "-" ]; then
+            age=$((warm_secs + 1))   # missing timestamp = treat as cold
+        else
+            age=$(( now - ts ))
+        fi
+        if [ "${age}" -lt "${warm_secs}" ] && [ -z "${pressure}" ]; then
+            continue                  # warm and no pressure: keep
+        fi
+        common::log INFO "Evicting template ${ds##*/} (age ${age}s)"
+        zfs destroy "${ds}@${zfs_pristine_snap}" 2> /dev/null || :
+        zfs destroy "${ds}" 2> /dev/null || :
+        if [ -n "${pressure}" ]; then
+            zfs::under_pressure || break
+        fi
+    done
+}
+
 # Computes the sha256 of a squashfs image file. Used as the template cache key.
 zfs::image_sha256() {
     local -r image="$1"
@@ -109,6 +138,8 @@ zfs::ensure_template() {
     local -r snap="${template}@${zfs_pristine_snap}"
     local mountpoint
     local i timeout=600
+
+    zfs::sweep_templates
 
     # Fast path: template already exists with @pristine.
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
@@ -245,6 +276,8 @@ zfs::docker_install_from_layers() {
     template="${store}/${zfs_template_subdir}/${cache_key}"
     tmp="${template}.tmp"
     snap="${template}@${zfs_pristine_snap}"
+
+    zfs::sweep_templates
 
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
         common::log INFO "Reusing cached template ${cache_key:0:12}"
