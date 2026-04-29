@@ -122,6 +122,8 @@ $(error MUSL CC wrapper not found for $(CC))
 endif
 endif
 
+bin/enroot-zfs-mount: CPPFLAGS += -DSYSCONFDIR=\"$(sysconfdir)\"
+
 $(BIN) $(CONFIG): %: %.in
 	sed -e 's;@sysconfdir@;$(SYSCONFDIR);' \
 	    -e 's;@libdir@;$(LIBDIR);' \

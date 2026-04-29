@@ -16,7 +16,6 @@
 
 #define _GNU_SOURCE
 #include <err.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +24,66 @@
 
 #include "common.h"
 
+#ifndef SYSCONFDIR
+# define SYSCONFDIR "/usr/local/etc"
+#endif
+#define CONF_PATH SYSCONFDIR "/enroot/enroot.conf"
+
 static struct capabilities_v3 caps;
+
+/*
+ * Reads ENROOT_DATA_PATH from the system enroot.conf. Returns a malloc'd
+ * string the caller must free, or NULL if the key is absent. Errors out if
+ * the conf file itself can't be opened.
+ *
+ * Format mirrors the bash side's IFS=$' \t=' read: lines are `KEY VALUE`
+ * with whitespace or `=` as separator. Comments start with `#`.
+ */
+static char *
+read_data_path(void)
+{
+        FILE *f;
+        char *line = NULL;
+        size_t len = 0;
+        ssize_t n;
+        char *result = NULL;
+
+        f = fopen(CONF_PATH, "r");
+        if (f == NULL)
+                err(EXIT_FAILURE, "cannot read %s", CONF_PATH);
+
+        while ((n = getline(&line, &len, f)) != -1) {
+                char *p, *key;
+
+                if (n > 0 && line[n - 1] == '\n')
+                        line[n - 1] = '\0';
+
+                p = line;
+                while (*p == ' ' || *p == '\t')
+                        p++;
+                if (*p == '\0' || *p == '#')
+                        continue;
+
+                key = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '=')
+                        p++;
+                if (*p == '\0')
+                        continue;
+                *p++ = '\0';
+                while (*p == ' ' || *p == '\t' || *p == '=')
+                        p++;
+
+                if (!strcmp(key, "ENROOT_DATA_PATH")) {
+                        result = strdup(p);
+                        if (result == NULL)
+                                err(EXIT_FAILURE, "strdup");
+                        break;
+                }
+        }
+        free(line);
+        fclose(f);
+        return (result);
+}
 
 static void
 init_capabilities(void)
@@ -101,7 +159,10 @@ main(int argc, char *argv[])
 
         init_capabilities();
 
-        /* TODO Task 2-4: validate the dataset before doing privileged work */
+        char *data_path = read_data_path();
+        if (data_path == NULL)
+                errx(EXIT_FAILURE, "ENROOT_DATA_PATH is not set in %s", CONF_PATH);
+        /* TODO Task 3-4: validate the dataset is under data_path's parent dataset */
 
         if (do_unmount) {
                 /* TODO Task 5 */
@@ -111,5 +172,6 @@ main(int argc, char *argv[])
         if (do_mount(dataset, "/tmp/zfs-mount-skeleton-stub", "zfs", 0, NULL) < 0)
                 err(EXIT_FAILURE, "mount failed");
 
+        free(data_path);
         return (EXIT_SUCCESS);
 }
