@@ -163,3 +163,65 @@ zfs::ephemeral_destroy() {
     [ -z "${clone}" ] && return
     zfs destroy "${clone}" 2> /dev/null || :
 }
+
+# Errors (or destroys with --force) if a container with this name already exists
+# in the ZFS store. Used as an early-exit gate before doing expensive work
+# (e.g. downloading Docker layers we'd just throw away).
+zfs::container_check() {
+    local -r name="$1"
+    local target
+    target="$(zfs::store_dataset)/${name}"
+    if zfs list -H "${target}" > /dev/null 2>&1; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "Container already exists: ${name}"
+        fi
+        zfs destroy -r "${target}"
+    fi
+}
+
+# Materializes the merged Docker rootfs into a ZFS template (cached by
+# cache_key) and clones it as the user's named container. Designed to be
+# called from docker::load AFTER docker::_prepare_layers has populated the
+# cwd with extracted, whiteout-converted layer directories 0/, 1/, ..., N/.
+#
+# Inputs:
+#   $1 cache_key   - sha256 of the image config blob (a stable per-image key)
+#   $2 layer_count - the N from _prepare_layers (count of layer directories)
+#   $3 unpriv      - "y" or "" — whether to enter a new user namespace
+#   $4 name        - the user-visible container name (no slashes)
+#
+# Atomicity: races on the same cache_key are resolved via a per-key .tmp
+# dataset lock; losers wait for @pristine. ENOSPC mid-merge destroys the
+# .tmp so a retry can run.
+zfs::docker_install_from_layers() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+    local store template tmp snap mountpoint i=0
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${cache_key}"
+    tmp="${template}.tmp"
+    snap="${template}@${zfs_pristine_snap}"
+
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        common::log INFO "Reusing cached template ${cache_key:0:12}"
+    elif zfs create -p "${tmp}" 2> /dev/null; then
+        mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+        mkdir -p rootfs
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root \
+                bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
+                         tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"; then
+            zfs destroy -r "${tmp}" 2> /dev/null || :
+            common::err "Failed to merge Docker layers into ZFS template"
+        fi
+        zfs rename "${tmp}" "${template}"
+        zfs snapshot "${snap}"
+        zfs set readonly=on "${template}"
+    else
+        # Lost the race or stale .tmp — wait for @pristine.
+        while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
+            sleep 1
+            ((i++ < 600)) || common::err "Timed out waiting for Docker template: ${template}"
+        done
+    fi
+
+    zfs::clone_container "${template}" "${name}"
+}

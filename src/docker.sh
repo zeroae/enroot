@@ -515,14 +515,7 @@ docker::load() (
     fi
 
     if zfs::enabled; then
-        # Early existence check so we don't download layers we'll throw away.
-        local _target_ds="$(zfs::store_dataset)/${name}"
-        if zfs list -H "${_target_ds}" > /dev/null 2>&1; then
-            if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
-                common::err "Container already exists: ${name}"
-            fi
-            zfs destroy -r "${_target_ds}"
-        fi
+        zfs::container_check "${name}"
     else
         name=$(common::realpath "${ENROOT_DATA_PATH}/${name}")
         if [ -e "${name}" ]; then
@@ -552,41 +545,7 @@ docker::load() (
     fi
 
     if zfs::enabled; then
-        # ZFS path: cache the merged rootfs in a template dataset keyed by the
-        # image config digest, then clone for the user. The .tmp lock is the
-        # same atomic-create pattern as zfs::ensure_template; the merge itself
-        # reuses the dir backend's overlay+tar-pipe but redirects the output
-        # to the template's mountpoint instead of a directory.
-        local cache_key="${config}"
-        local store template tmp snap mountpoint i=0
-        store=$(zfs::store_dataset)
-        template="${store}/${zfs_template_subdir}/${cache_key}"
-        tmp="${template}.tmp"
-        snap="${template}@${zfs_pristine_snap}"
-
-        if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
-            common::log INFO "Reusing cached template ${cache_key:0:12}"
-        elif zfs create -p "${tmp}" 2> /dev/null; then
-            mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
-            mkdir -p rootfs
-            if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root \
-                    bash -c "mount --make-rprivate / && mount -t overlay overlay -o lowerdir=0:$(seq -s: 1 "${layer_count}") rootfs &&
-                             tar --numeric-owner -C rootfs/ --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"; then
-                zfs destroy -r "${tmp}" 2> /dev/null || :
-                common::err "Failed to merge layers into ZFS template"
-            fi
-            zfs rename "${tmp}" "${template}"
-            zfs snapshot "${snap}"
-            zfs set readonly=on "${template}"
-        else
-            # Lost the race or stale .tmp; wait for @pristine.
-            while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
-                sleep 1
-                ((i++ < 600)) || common::err "Timed out waiting for layer-stack template: ${template}"
-            done
-        fi
-
-        zfs::clone_container "${template}" "${name}"
+        zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
     else
         # Create a mount namespace and overlay mount
         mkdir -p rootfs "${name}"
