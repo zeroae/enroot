@@ -437,23 +437,37 @@ runtime::create() {
     if [ ! -f "${image}" ]; then
         common::err "No such file or directory: ${image}"
     fi
-    if ! unsquashfs -s "${image}" > /dev/null 2>&1; then
-        common::err "Invalid image format: ${image}"
-    fi
 
-    # Resolve the container rootfs name.
-    if [ -z "${rootfs}" ]; then
-        rootfs=$(basename "${image%.sqsh}")
-    fi
-    if [[ "${rootfs}" == */* ]]; then
-        common::err "Invalid argument: ${rootfs}"
-    fi
-
-    if zfs::enabled; then
-        runtime::_create_zfs "${image}" "${rootfs}"
-    else
-        runtime::_create_dir "${image}" "${rootfs}"
-    fi
+    case "${image}" in
+        *.zfs)
+            if ! zfs::enabled; then
+                common::err ".zfs images require ENROOT_STORAGE_BACKEND=zfs"
+            fi
+            if [ -z "${rootfs}" ]; then
+                rootfs=$(basename "${image%.zfs}")
+            fi
+            if [[ "${rootfs}" == */* ]]; then
+                common::err "Invalid argument: ${rootfs}"
+            fi
+            zfs::create_from_stream "${image}" "${rootfs}"
+            ;;
+        *)
+            if ! unsquashfs -s "${image}" > /dev/null 2>&1; then
+                common::err "Invalid image format: ${image} (expected .sqsh or .zfs)"
+            fi
+            if [ -z "${rootfs}" ]; then
+                rootfs=$(basename "${image%.sqsh}")
+            fi
+            if [[ "${rootfs}" == */* ]]; then
+                common::err "Invalid argument: ${rootfs}"
+            fi
+            if zfs::enabled; then
+                runtime::_create_zfs "${image}" "${rootfs}"
+            else
+                runtime::_create_dir "${image}" "${rootfs}"
+            fi
+            ;;
+    esac
 }
 
 runtime::_create_dir() {
@@ -462,6 +476,7 @@ runtime::_create_dir() {
 
     common::checkcmd unsquashfs find
 
+    # Resolve the container rootfs path.
     rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ -e "${rootfs}" ]; then
         if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
@@ -471,6 +486,7 @@ runtime::_create_dir() {
         fi
     fi
 
+    # Extract the container rootfs from the image.
     common::log INFO "Extracting squashfs filesystem..." NL
     # XXX: https://github.com/NVIDIA/enroot/issues/90
     [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
@@ -549,19 +565,41 @@ runtime::load() {
 }
 
 runtime::export() {
-    local rootfs="$1" filename="$2"
-    local exclude=()
+    local rootfs_name="$1" filename="$2" format="${3:-sqsh}"
+
+    if [ -z "${rootfs_name}" ]; then
+        common::err "Invalid argument"
+    fi
+    if [[ "${rootfs_name}" == */* ]]; then
+        common::err "Invalid argument: ${rootfs_name}"
+    fi
+
+    case "${format}" in
+        sqsh) ;;
+        zfs)
+            if ! zfs::enabled; then
+                common::err "--format=zfs requires ENROOT_STORAGE_BACKEND=zfs"
+            fi
+            ;;
+        *) common::err "Invalid format: ${format}" ;;
+    esac
+
+    if [ "${format}" = "sqsh" ]; then
+        runtime::_export_sqsh "${rootfs_name}" "${filename}"
+    else
+        zfs::export_to_file "${rootfs_name}" "${filename}"
+    fi
+}
+
+runtime::_export_sqsh() {
+    local -r rootfs_name="$1"
+    local filename="$2"
+    local rootfs exclude=()
 
     common::checkcmd mksquashfs
 
     # Resolve the container rootfs path.
-    if [ -z "${rootfs}" ]; then
-        common::err "Invalid argument"
-    fi
-    if [[ "${rootfs}" == */* ]]; then
-        common::err "Invalid argument: ${rootfs}"
-    fi
-    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs}")
+    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
@@ -657,6 +695,7 @@ runtime::list() {
 runtime::remove() {
     local rootfs_name="$1"
 
+    # Resolve the container rootfs path.
     if [ -z "${rootfs_name}" ]; then
         common::err "Invalid argument"
     fi
@@ -678,6 +717,8 @@ runtime::_remove_dir() {
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
+
+    # Remove the rootfs specified after asking for confirmation.
     if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
         read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
     fi
@@ -690,6 +731,8 @@ runtime::_remove_zfs() {
     local -r rootfs_name="$1"
     local rootfs
     rootfs="${ENROOT_DATA_PATH}/${rootfs_name}"
+
+    # Remove the rootfs specified after asking for confirmation.
     if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
         read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
     fi

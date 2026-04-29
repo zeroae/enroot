@@ -170,8 +170,9 @@ enroot::usage() {
 		Create a container image from a container root filesystem.
 		
 		 Options:
-		   -o, --output  Name of the output image file (defaults to "NAME.sqsh")
+		   -o, --output  Name of the output image file (defaults to "NAME.sqsh" or "NAME.zfs")
 		   -f, --force   Overwrite an existing container image
+		       --format  Output format: "sqsh" (default) or "zfs" (zfs send stream; requires ZFS backend)
 		EOF
         ;;
     import)
@@ -444,7 +445,7 @@ enroot::load() {
 }
 
 enroot::export() {
-    local name= filename=
+    local name= filename= format=sqsh
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -462,6 +463,16 @@ enroot::export() {
             filename="${1#*=}"
             shift
             ;;
+        --format)
+            [ -z "${2-}" ] && enroot::usage export 1
+            format="$2"
+            shift 2
+            ;;
+        --format=*)
+            [ -z "${1#*=}" ] && enroot::usage export 1
+            format="${1#*=}"
+            shift
+            ;;
         -h|--help)
             enroot::usage export 0 ;;
         --)
@@ -477,7 +488,7 @@ enroot::export() {
     fi
     name="$1"
 
-    runtime::export "${name}" "${filename}"
+    runtime::export "${name}" "${filename}" "${format}"
 }
 
 enroot::create() {
