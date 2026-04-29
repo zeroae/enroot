@@ -363,6 +363,21 @@ main(int argc, char *argv[])
         if (!path_under(mp, data_path))
                 errx(EXIT_FAILURE, "mountpoint %s is not under %s", mp, data_path);
 
+        /* If the dataset is already mounted, succeed silently iff at the
+         * expected mountpoint; error otherwise (defends against double-mounts
+         * and surprises if a sibling mount table got reshuffled). */
+        char *cur = find_current_mountpoint(dataset);
+        if (cur != NULL) {
+                if (strcmp(cur, mp) == 0) {
+                        free(cur);
+                        free(mp);
+                        free(parent_ds);
+                        free(data_path);
+                        return (EXIT_SUCCESS);
+                }
+                errx(EXIT_FAILURE, "dataset %s is already mounted at %s", dataset, cur);
+        }
+
         /* mkdir runs as the calling uid (DAC_OVERRIDE is in permitted but not
          * effective; we don't raise it). If the dir already exists this is a
          * no-op. If the calling user can't create it, that's the right
