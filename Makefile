@@ -177,6 +177,7 @@ distclean: clean
 setcap:
 	setcap cap_sys_admin+pe $(BINDIR)/enroot-mksquashovlfs
 	setcap cap_sys_admin,cap_mknod+pe $(BINDIR)/enroot-aufs2ovlfs
+	setcap cap_sys_admin+pe $(BINDIR)/enroot-zfs-mount
 
 deb: export DEBFULLNAME := $(USERNAME)
 deb: export DEBEMAIL    := $(EMAIL)

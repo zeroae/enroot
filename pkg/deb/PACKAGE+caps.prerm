@@ -9,6 +9,7 @@ case "$1" in
     remove|upgrade|deconfigure)
         setcap cap_sys_admin-pe "$(command -v enroot-mksquashovlfs)"
         setcap cap_sys_admin,cap_mknod-pe "$(command -v enroot-aufs2ovlfs)"
+        setcap cap_sys_admin-pe "$(command -v enroot-zfs-mount)"
     ;;
 
     failed-upgrade)
