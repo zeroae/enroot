@@ -114,6 +114,7 @@ zfs::sweep_templates() {
         fi
         common::log INFO "Evicting template ${ds##*/} (age ${age}s)"
         zfs destroy "${ds}@${zfs_pristine_snap}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${ds}" 2> /dev/null || :
         zfs destroy "${ds}" 2> /dev/null || :
         if [ -n "${pressure}" ]; then
             zfs::under_pressure || break
@@ -148,9 +149,25 @@ zfs::ensure_template() {
         return
     fi
 
+    # Ensure the templates parent exists. Use -u so Linux does not auto-mount it
+    # (which would require CAP_SYS_ADMIN); mount it explicitly via the helper.
+    local -r templates_ds="${store}/${zfs_template_subdir}"
+    zfs create -u "${templates_ds}" 2> /dev/null || :
+    enroot-zfs-mount "${templates_ds}" 2> /dev/null || :
+
     # Try to create the .tmp dataset atomically. Whoever wins is the extractor.
-    if zfs create -p "${tmp}" 2> /dev/null; then
-        # We won — extract.
+    # -u: skip auto-mount (Linux requires CAP_SYS_ADMIN for mount(2)); we call
+    # enroot-zfs-mount explicitly below. No -p needed — parent was ensured above.
+    if zfs create -u "${tmp}" 2> /dev/null; then
+        # We won — mount it via the cap-elevated helper so unprivileged callers
+        # can write into it. Linux mount(2) needs CAP_SYS_ADMIN regardless of
+        # 'zfs allow' delegation; enroot-zfs-mount (in the +caps package)
+        # carries cap_sys_admin and validates the dataset is under
+        # ENROOT_DATA_PATH before mounting.
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy "${tmp}" 2> /dev/null || :
+            common::err "failed to mount template; install enroot+caps to enable unprivileged mount"
+        fi
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         common::log INFO "Extracting squashfs filesystem into ZFS template..." NL
         [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
@@ -164,7 +181,9 @@ zfs::ensure_template() {
                    common::err "Extraction failed even after evicting warm templates"; }
         fi
         common::fixperms "${mountpoint}"
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
         zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
         zfs::touch_template "${template}"
@@ -199,7 +218,11 @@ zfs::clone_container() {
         zfs destroy -r "${target}"
     fi
 
-    zfs clone "${template}@${zfs_pristine_snap}" "${target}"
+    zfs clone -u "${template}@${zfs_pristine_snap}" "${target}"
+    if ! enroot-zfs-mount "${target}" 2> /dev/null; then
+        zfs destroy "${target}" 2> /dev/null || :
+        common::err "failed to mount cloned container ${name}"
+    fi
 }
 
 # Destroys a user container. The clone's origin template is left in place;
@@ -215,6 +238,7 @@ zfs::destroy_container() {
     if ! zfs list -H "${target}" > /dev/null 2>&1; then
         common::err "No such container: ${name}"
     fi
+    enroot-zfs-mount --unmount "${target}" 2> /dev/null || :
     zfs destroy "${target}"
 }
 
@@ -232,9 +256,14 @@ zfs::ephemeral_clone() {
     template=$(zfs::ensure_template "${image}" "${sha}")
 
     clone="${store}/${zfs_ephemeral_subdir}/${$}-${sha:0:12}"
-    zfs create -p "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
-    zfs clone "${template}@${zfs_pristine_snap}" "${clone}"
+    zfs create -u "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_ephemeral_subdir}" 2> /dev/null || :
+    zfs clone -u "${template}@${zfs_pristine_snap}" "${clone}"
     zfs set readonly=off "${clone}"
+    if ! enroot-zfs-mount "${clone}" 2> /dev/null; then
+        zfs destroy "${clone}" 2> /dev/null || :
+        common::err "failed to mount ephemeral clone"
+    fi
 
     mountpoint=$(zfs get -H -o value mountpoint "${clone}")
     printf "%s\t%s" "${clone}" "${mountpoint}"
@@ -244,6 +273,7 @@ zfs::ephemeral_clone() {
 zfs::ephemeral_destroy() {
     local -r clone="$1"
     [ -z "${clone}" ] && return
+    enroot-zfs-mount --unmount "${clone}" 2> /dev/null || :
     zfs destroy "${clone}" 2> /dev/null || :
 }
 
@@ -346,7 +376,8 @@ zfs::import_uri() {
             local -r store=$(zfs::store_dataset)
             local -r tmp_ds="${store}/${zfs_template_subdir}/import-$$.tmp"
             local mountpoint
-            zfs create -p "${store}/${zfs_template_subdir}" 2> /dev/null || :
+            zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+            enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
             common::log INFO "Pulling ${remote_name} from ${host} (sqsh)" NL
             if ! ssh "${host}" enroot export --zfs-send "${remote_name}" \
                   | zfs receive -F "${tmp_ds}"; then
@@ -466,14 +497,21 @@ zfs::ensure_template_from_stream() {
     fi
 
     # Ensure the templates parent exists before receive (zfs receive does not
-    # auto-create parents).
-    zfs create -p "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    # auto-create parents). Use -u to skip auto-mount; mount explicitly.
+    zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
 
-    if zfs receive -F "${tmp}" < "${stream}" 2> /dev/null; then
+    if zfs receive -u -F "${tmp}" < "${stream}" 2> /dev/null; then
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy -r "${tmp}" 2> /dev/null || :
+            common::err "failed to mount received template"
+        fi
         # The received dataset brings its own snapshot. Rename the dataset to
         # the final template name; if the recv'd snapshot wasn't already named
         # @pristine, alias it.
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
         zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
         if ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
             local recvd_snap
             recvd_snap=$(zfs list -H -t snapshot -o name -r -d 1 "${template}" | head -1)
@@ -550,10 +588,18 @@ zfs::docker_install_from_layers() {
 
     zfs::sweep_templates
 
+    # Ensure the templates parent exists without auto-mounting it.
+    zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
+
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
         common::log INFO "Reusing cached template ${cache_key:0:12}"
         zfs::touch_template "${template}"
-    elif zfs create -p "${tmp}" 2> /dev/null; then
+    elif zfs create -u "${tmp}" 2> /dev/null; then
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy "${tmp}" 2> /dev/null || :
+            common::err "failed to mount docker template"
+        fi
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         mkdir -p rootfs
         local merge_cmd
@@ -566,7 +612,9 @@ zfs::docker_install_from_layers() {
               || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
                    common::err "Failed to merge Docker layers into ZFS template even after evicting warm templates"; }
         fi
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
         zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
         zfs::touch_template "${template}"

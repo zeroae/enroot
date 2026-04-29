@@ -1,3 +1,12 @@
+#PACKAGE# (4.1.2.zfs.2-1) UNRELEASED; urgency=medium
+
+  * Add bin/enroot-zfs-mount cap_sys_admin helper (shipped with enroot+caps)
+    that validates and performs mount(2)/umount2(2) of ZFS datasets owned by
+    the calling user, so that unprivileged enroot create/load/start/remove
+    work on the ZFS backend (issue #9 — pyxis/Slurm integration).
+
+ -- #USERNAME# <#EMAIL#>  Wed, 29 Apr 2026 16:00:00 +0000
+
 #PACKAGE# (4.1.2.zfs.1-1) UNRELEASED; urgency=medium
 
   * Add optional ZFS storage backend (ENROOT_STORAGE_BACKEND=zfs).

@@ -13,7 +13,7 @@ LIBDIR     = $(DESTDIR)$(libdir)/enroot
 SYSCONFDIR = $(DESTDIR)$(sysconfdir)/enroot
 DATADIR    = $(DESTDIR)$(datadir)/enroot
 
-VERSION       := 4.1.2.zfs.1
+VERSION       := 4.1.2.zfs.2
 PACKAGE       ?= enroot
 ARCH          ?= $(shell uname -m)
 DEBUG         ?=
@@ -38,7 +38,8 @@ UTILS := bin/enroot-aufs2ovlfs    \
          bin/enroot-mksquashovlfs \
          bin/enroot-mount         \
          bin/enroot-switchroot    \
-         bin/enroot-nsenter
+         bin/enroot-nsenter       \
+         bin/enroot-zfs-mount
 
 CONFIGFILE := enroot.conf
 CONFIG := conf/$(CONFIGFILE)
@@ -121,6 +122,8 @@ $(error MUSL CC wrapper not found for $(CC))
 endif
 endif
 
+bin/enroot-zfs-mount: CPPFLAGS += -DSYSCONFDIR=\"$(sysconfdir)\"
+
 $(BIN) $(CONFIG): %: %.in
 	sed -e 's;@sysconfdir@;$(SYSCONFDIR);' \
 	    -e 's;@libdir@;$(LIBDIR);' \
@@ -174,6 +177,7 @@ distclean: clean
 setcap:
 	setcap cap_sys_admin+pe $(BINDIR)/enroot-mksquashovlfs
 	setcap cap_sys_admin,cap_mknod+pe $(BINDIR)/enroot-aufs2ovlfs
+	setcap cap_sys_admin+pe $(BINDIR)/enroot-zfs-mount
 
 deb: export DEBFULLNAME := $(USERNAME)
 deb: export DEBEMAIL    := $(EMAIL)
