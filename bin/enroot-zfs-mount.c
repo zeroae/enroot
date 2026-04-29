@@ -195,6 +195,48 @@ read_data_path(void)
         return (result);
 }
 
+/*
+ * Walks /proc/self/mounts looking for a "zfs" mount whose SOURCE is
+ * `dataset` (not whose mountpoint matches a path). Returns the current
+ * mountpoint path (malloc'd), or NULL if the dataset isn't mounted anywhere
+ * we can see.
+ */
+static char *
+find_current_mountpoint(const char *dataset)
+{
+        FILE *f;
+        char *line = NULL, *result = NULL;
+        size_t len = 0;
+        ssize_t n;
+
+        f = fopen("/proc/self/mounts", "r");
+        if (f == NULL)
+                err(EXIT_FAILURE, "cannot read /proc/self/mounts");
+
+        while ((n = getline(&line, &len, f)) != -1) {
+                char src[PATH_MAX], mp[PATH_MAX], type[64];
+
+                (void)n;
+
+                if (sscanf(line, "%4095s %4095s %63s", src, mp, type) != 3)
+                        continue;
+                if (strcmp(type, "zfs") != 0)
+                        continue;
+                if (strcmp(src, dataset) == 0) {
+                        result = strdup(mp);
+                        if (result == NULL) {
+                                free(line);
+                                fclose(f);
+                                err(EXIT_FAILURE, "strdup");
+                        }
+                        break;
+                }
+        }
+        free(line);
+        fclose(f);
+        return (result);
+}
+
 static void
 init_capabilities(void)
 {
@@ -227,6 +269,23 @@ do_mount(const char *source, const char *target, const char *fstype,
                 return (-1);
 
         rv = mount(source, target, fstype, flags, data);
+
+        CAP_CLR(&caps, effective, CAP_SYS_ADMIN);
+        if (capset(&caps.hdr, caps.data) < 0)
+                return (-1);
+        return (rv);
+}
+
+static int
+do_umount(const char *target, int flags)
+{
+        int rv;
+
+        CAP_SET(&caps, effective, CAP_SYS_ADMIN);
+        if (capset(&caps.hdr, caps.data) < 0)
+                return (-1);
+
+        rv = umount2(target, flags);
 
         CAP_CLR(&caps, effective, CAP_SYS_ADMIN);
         if (capset(&caps.hdr, caps.data) < 0)
@@ -281,8 +340,21 @@ main(int argc, char *argv[])
                 errx(EXIT_FAILURE, "dataset %s is not under %s", dataset, parent_ds);
 
         if (do_unmount) {
-                /* TODO Task 5 */
-                errx(EXIT_FAILURE, "unmount not implemented yet");
+                char *cur = find_current_mountpoint(dataset);
+                if (cur == NULL) {
+                        free(parent_ds);
+                        free(data_path);
+                        return (EXIT_SUCCESS);  /* not mounted; idempotent no-op */
+                }
+                if (!path_under(cur, data_path))
+                        errx(EXIT_FAILURE, "current mountpoint %s is not under %s",
+                             cur, data_path);
+                if (do_umount(cur, 0) < 0)
+                        err(EXIT_FAILURE, "umount %s", cur);
+                free(cur);
+                free(parent_ds);
+                free(data_path);
+                return (EXIT_SUCCESS);
         }
 
         char *mp = get_mountpoint(dataset);
