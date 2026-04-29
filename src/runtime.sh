@@ -13,6 +13,7 @@
 # limitations under the License.
 
 source "${ENROOT_LIBRARY_PATH}/common.sh"
+source "${ENROOT_LIBRARY_PATH}/storage_zfs.sh"
 
 readonly hook_dirs=("${ENROOT_SYSCONF_PATH}/hooks.d" "${ENROOT_CONFIG_PATH}/hooks.d")
 readonly mount_dirs=("${ENROOT_SYSCONF_PATH}/mounts.d" "${ENROOT_CONFIG_PATH}/mounts.d")
@@ -347,6 +348,43 @@ runtime::start() {
     # Check if we're running unprivileged.
     if [ -z "${ENROOT_ALLOW_SUPERUSER-}" ] || [ "${EUID}" -ne 0 ]; then
         unpriv=y
+    fi
+
+    # ZFS backend: when starting from an image file, clone the template into an
+    # ephemeral dataset BEFORE entering the user namespace (zfs(8) cannot
+    # enumerate datasets from inside a userns) and fork a shim into its own
+    # process group to destroy the clone when the container exits. The shim
+    # mirrors runtime::_mount_rootfs_shim's orphaned-process-group cleanup
+    # pattern: it parks itself with SIGSTOP, gets SIGHUP'd by the kernel once
+    # this shell's exec'd container chain exits, and then runs zfs destroy.
+    if zfs::enabled && [ -f "${rootfs}" ]; then
+        local _zfs_eph_out _zfs_eph_clone _zfs_eph_mountpoint _zfs_eph_pid _zfs_eph_rv=0
+        _zfs_eph_out=$(zfs::ephemeral_clone "${rootfs}")
+        _zfs_eph_clone="${_zfs_eph_out%%$'\t'*}"
+        _zfs_eph_mountpoint="${_zfs_eph_out##*$'\t'}"
+
+        set -m
+        (
+            exec -a zfs-eph-shim "${BASH}" <<- EOF
+		$(declare -f zfs::ephemeral_destroy common::log common::fmt)
+		runtime::_zfs_ephemeral_shim() {
+		    trap "zfs::ephemeral_destroy '${_zfs_eph_clone}'; exit 0" SIGHUP
+		    kill -STOP \$\$
+		}
+		runtime::_zfs_ephemeral_shim
+		EOF
+        ) > /dev/null 2>&1 & _zfs_eph_pid=$!
+
+        # Wait for the shim to park itself (exit code 128+SIGSTOP=147).
+        wait "${_zfs_eph_pid}" 2> /dev/null || _zfs_eph_rv=$?
+        set +m
+        if ((_zfs_eph_rv != 128 + 19)); then
+            zfs::ephemeral_destroy "${_zfs_eph_clone}"
+            common::err "ZFS ephemeral cleanup shim failed to start (rv=${_zfs_eph_rv})"
+        fi
+        disown "${_zfs_eph_pid}" > /dev/null 2>&1
+
+        rootfs="${_zfs_eph_mountpoint}"
     fi
 
     # Create new namespaces and start the container.
