@@ -767,3 +767,56 @@ zfs::docker_install_from_layers() {
     template=$(zfs::_install_template_from_layers "${cache_key}" "${layer_count}" "${unpriv}")
     zfs::clone_container "${template}" "${name}"
 }
+
+# Import flow for docker:// URIs when the ZFS backend is active and the
+# pointer format is selected. Pulls layers (via docker::_prepare_layers),
+# fetches the manifest digest (via docker::digest), populates the
+# layer-keyed template cache (via zfs::_install_template_from_layers),
+# and writes a pointer file at output_path. Skips mksquashfs entirely.
+#
+# Counterpart of docker::import for the pointer flow. Modeled on
+# docker::load (which uses the same layer-pull + template-install
+# combination for direct enroot create docker://X).
+#
+# Inputs:
+#   $1 uri          - docker://[USER@]REGISTRY[:PORT]/IMAGE[:TAG]
+#   $2 output_path  - where to write the pointer (caller pre-validated)
+#   $3 arch         - already debarch-normalized
+zfs::import_docker_pointer() {
+    local -r uri="$1" output_path="$2" arch="$3"
+    local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
+    local manifest_digest=
+
+    common::checkcmd curl grep awk jq parallel tar "${ENROOT_GZIP_PROGRAM}" find zstd
+
+    docker::_parse_uri "${uri}" \
+      | { common::read -r user; common::read -r registry; common::read -r image; common::read -r tag; }
+
+    # Fetch the manifest digest first (cheap HEAD on the manifest URL).
+    # We do this before the expensive layer pull so a registry-side
+    # mismatch fails fast.
+    manifest_digest=$(docker::digest "${uri}" "${arch}")
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "registry returned invalid manifest digest: ${manifest_digest}"
+
+    # Create a temporary directory and chdir to it (same pattern as
+    # docker::import / docker::load — _prepare_layers writes layer
+    # directories into the cwd).
+    trap 'common::rmall "${tmpdir}" 2> /dev/null; rm -f "${token_dir}"/*.$$ 2> /dev/null' EXIT
+    tmpdir=$(common::mktmpdir enroot)
+    common::chdir "${tmpdir}"
+
+    ENROOT_SET_USER_XATTRS=y docker::_prepare_layers "${user}" "${registry}" "${image}" "${tag}" "${arch}" \
+      | { common::read -r config; common::read -r layer_count; }
+
+    # Running as a non-root user requires entering a user namespace for the
+    # tar-over-overlayfs merge inside _install_template_from_layers (same
+    # logic as docker::load).
+    if [ "${EUID}" -ne 0 ]; then
+        unpriv=y
+    fi
+
+    zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
+
+    zfs::write_pointer "${output_path}" "${config}" "${manifest_digest}" "${arch}" "${uri}"
+}
