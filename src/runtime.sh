@@ -617,26 +617,46 @@ runtime::list() {
 }
 
 runtime::remove() {
-    local rootfs="$1"
+    local rootfs_name="$1"
 
-    # Resolve the container rootfs path.
-    if [ -z "${rootfs}" ]; then
+    if [ -z "${rootfs_name}" ]; then
         common::err "Invalid argument"
     fi
-    if [[ "${rootfs}" == */* ]]; then
-        common::err "Invalid argument: ${rootfs}"
+    if [[ "${rootfs_name}" == */* ]]; then
+        common::err "Invalid argument: ${rootfs_name}"
     fi
-    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs}")
+
+    if zfs::enabled; then
+        runtime::_remove_zfs "${rootfs_name}"
+    else
+        runtime::_remove_dir "${rootfs_name}"
+    fi
+}
+
+runtime::_remove_dir() {
+    local -r rootfs_name="$1"
+    local rootfs
+    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
-
-    # Remove the rootfs specified after asking for confirmation.
     if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
         read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
     fi
     if [ -n "${ENROOT_FORCE_OVERRIDE-}" ] || [ "${REPLY}" = "y" ] || [ "${REPLY}" = "Y" ]; then
         common::rmall "${rootfs}"
+    fi
+}
+
+runtime::_remove_zfs() {
+    local -r rootfs_name="$1"
+    local rootfs
+    rootfs="${ENROOT_DATA_PATH}/${rootfs_name}"
+    if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+        read -r -e -p "Do you really want to delete ${rootfs}? [y/N] "
+    fi
+    if [ -n "${ENROOT_FORCE_OVERRIDE-}" ] || [ "${REPLY}" = "y" ] || [ "${REPLY}" = "Y" ]; then
+        zfs::destroy_container "${rootfs_name}"
     fi
 }
 
