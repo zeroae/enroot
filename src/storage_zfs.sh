@@ -44,3 +44,50 @@ zfs::image_sha256() {
     local -r image="$1"
     sha256sum "${image}" | awk '{print $1}'
 }
+
+# Ensures a template dataset exists for the given image hash, extracting if needed.
+# Prints the template's full dataset name (e.g. tank/enroot/.templates/<sha>).
+# Atomic across concurrent callers via a per-hash .tmp dataset.
+zfs::ensure_template() {
+    local -r image="$1" sha="$2"
+    local -r store=$(zfs::store_dataset)
+    local -r template="${store}/${zfs_template_subdir}/${sha}"
+    local -r tmp="${template}.tmp"
+    local -r snap="${template}@${zfs_pristine_snap}"
+    local mountpoint
+    local i timeout=600
+
+    # Fast path: template already exists with @pristine.
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        printf "%s" "${template}"
+        return
+    fi
+
+    # Try to create the .tmp dataset atomically. Whoever wins is the extractor.
+    if zfs create -p "${tmp}" 2> /dev/null; then
+        # We won — extract.
+        mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+        common::log INFO "Extracting squashfs filesystem into ZFS template..." NL
+        [ $(ulimit -n) -gt $((2**26)) ] && ulimit -n $((2**26))
+        unsquashfs ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
+                   -user-xattrs -f -d "${mountpoint}" "${image}" >&2
+        common::fixperms "${mountpoint}"
+        zfs rename "${tmp}" "${template}"
+        zfs snapshot "${snap}"
+        zfs set readonly=on "${template}"
+        printf "%s" "${template}"
+        return
+    fi
+
+    # Lost the race or stale .tmp from a crashed extractor. Wait for @pristine.
+    for ((i = 0; i < timeout; i++)); do
+        if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+            printf "%s" "${template}"
+            return
+        fi
+        sleep 1
+    done
+
+    common::err "Timed out waiting for template extraction: ${template}. \
+A previous extractor may have crashed; remove ${tmp} manually and retry."
+}
