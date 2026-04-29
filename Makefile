@@ -38,7 +38,8 @@ UTILS := bin/enroot-aufs2ovlfs    \
          bin/enroot-mksquashovlfs \
          bin/enroot-mount         \
          bin/enroot-switchroot    \
-         bin/enroot-nsenter
+         bin/enroot-nsenter       \
+         bin/enroot-zfs-mount
 
 CONFIGFILE := enroot.conf
 CONFIG := conf/$(CONFIGFILE)
