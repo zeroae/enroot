@@ -1,6 +1,6 @@
 # ZFS storage backend
 
-This document describes an optional ZFS-aware mode for the enroot container store. It is a design proposal — not yet implemented. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
+This document describes an optional ZFS-aware mode for the enroot container store. **Plan A (foundation) is implemented**: `enroot create` and `enroot remove` use ZFS datasets when `ENROOT_STORAGE_BACKEND=zfs`. The remaining substitutions (template warm/cold lifecycle, `.zfs` file format, `zfs://` URI, ephemeral-start ZFS path, Docker layer stacking on ZFS) are tracked under `doc/plans/`. The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
 
 ## Motivation
 
@@ -198,6 +198,13 @@ A site enabling the ZFS backend should:
    ```
 
    `zfs receive` from `.zfs` files and `zfs://` requires this delegation. Without it, the ZFS backend operates only on already-received templates.
+
+   **Linux mount(2) caveat:** ZFS delegation governs ZFS's *internal* logic, but on Linux the kernel `mount(2)` syscall still requires `CAP_SYS_ADMIN`. As a result, an unprivileged user invoking `enroot create` on the ZFS backend will see "filesystem successfully created, but it may only be mounted by root" warnings, and the dataset will not be auto-mounted. The two practical workarounds:
+
+   - **Privileged `create`, unprivileged everything else.** Run `enroot create` (and `enroot load`) as root or via sudo; `enroot start`, `exec`, and `remove` work unprivileged because they operate on already-mounted datasets or use mount-namespace tricks that don't need additional CAP_SYS_ADMIN.
+   - **`fs.namespace.unprivileged_userns_clone=1` + per-user mount namespace.** A wrapper that enters a user namespace before `enroot create` lets the ZFS auto-mount succeed without root, at the cost of complexity and a small overhead.
+
+   On hosts where the same operator runs `create` and `start`, the privileged-create approach is simpler and matches enroot's existing model where image conversion (`enroot import`/`enroot-aufs2ovlfs`) already requires elevated privileges.
 
 4. **Configure `ENROOT_STORAGE_BACKEND=zfs`** in `enroot.conf` (or per-user). Set `ENROOT_DATA_PATH` to the mountpoint of `tank/enroot` (or per-user subdataset).
 
