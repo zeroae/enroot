@@ -438,6 +438,24 @@ runtime::create() {
         common::err "No such file or directory: ${image}"
     fi
 
+    # Pointer-format .sqsh (ZFS backend): magic-prefixed file produced by
+    # `enroot import docker://` when ENROOT_ZFS_IMPORT_FORMAT=pointer
+    # (default on ZFS backend). Detect via magic bytes — filename is still
+    # .sqsh by convention so pyxis is unaware of the format.
+    if zfs::is_pointer "${image}"; then
+        if ! zfs::enabled; then
+            common::err "${image} is a ZFS pointer file; ENROOT_STORAGE_BACKEND=zfs is required to use it"
+        fi
+        if [ -z "${rootfs}" ]; then
+            rootfs=$(basename "${image%.sqsh}")
+        fi
+        if [[ "${rootfs}" == */* ]]; then
+            common::err "Invalid argument: ${rootfs}"
+        fi
+        zfs::create_from_pointer "${image}" "${rootfs}"
+        return
+    fi
+
     case "${image}" in
         *.zfs)
             if ! zfs::enabled; then
