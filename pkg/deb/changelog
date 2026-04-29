@@ -1,3 +1,14 @@
+#PACKAGE# (4.1.2.zfs.3-1) UNRELEASED; urgency=medium
+
+  * Replace `zfs clone -u` (added in OpenZFS 2.3) with `zfs clone -o
+    canmount=noauto` (works in 2.0+) so the ZFS backend functions on Ubuntu
+    24.04 LTS and other distros pinned to OpenZFS 2.2.x userspace.
+    Recommended `zfs allow` list in doc/zfs.md gains `userprop` so the
+    template warm/cold lifecycle's `enroot:last_used` set succeeds for
+    unprivileged callers (issue #11).
+
+ -- #USERNAME# <#EMAIL#>  Wed, 29 Apr 2026 18:00:00 +0000
+
 #PACKAGE# (4.1.2.zfs.2-1) UNRELEASED; urgency=medium
 
   * Add bin/enroot-zfs-mount cap_sys_admin helper (shipped with enroot+caps)
