@@ -19,6 +19,10 @@ The following table describes standard paths used by the runtime:
 
 When `enroot.conf` has been read, and if there is a directory `enroot.conf.d` next to `enroot.conf`, all files in that directory matching `*.conf` will be considered, too.
 
+## Storage backend (proposal)
+
+An optional ZFS-aware storage backend is being designed. It replaces extraction-per-create with a clone-on-create model, sharing immutable templates across containers. See [ZFS backend](zfs.md) for the full design, including the `ENROOT_STORAGE_BACKEND`, `ENROOT_TEMPLATE_WARM_SECONDS`, and `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` settings. The default backend (`dir`) is unchanged.
+
 ## Container configuration
 
 Common configurations can be applied to all containers by leveraging the following directories under `ENROOT_SYSCONF_PATH` (system-wide) and/or `ENROOT_CONFIG_PATH` (user-specific).
