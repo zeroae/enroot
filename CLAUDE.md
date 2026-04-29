@@ -70,7 +70,7 @@ When debugging container behavior, the order is: image `/etc/{rc,fstab,environme
 ## Active design proposals
 
 - **`doc/zfs.md`** — optional ZFS storage backend (`ENROOT_STORAGE_BACKEND=zfs`). Replaces `unsquashfs`-per-create with extract-once-then-`zfs clone`. Adds a `.zfs` (zfs send stream) image format and a `zfs://host/NAME` transport scheme alongside today's `.sqsh`. Introduces a shared template cache with a live/warm/cold lifecycle (knobs: `ENROOT_TEMPLATE_WARM_SECONDS`, `ENROOT_TEMPLATE_PRESSURE_THRESHOLD`; eviction is implicit on `create`, no daemon, no `enroot gc` command). Default backend (`dir`) is unchanged.
-- **`doc/plans/`** — six implementation plans (A–F) breaking the ZFS backend into independently-landable slices. Start with `doc/plans/README.md` for the index and recommended landing order (A → E → F → B → C → D). Plans add a new sourced module `src/storage_zfs.sh` (under a `zfs::` namespace) and branch in `src/runtime.sh`, `src/docker.sh` on `ENROOT_STORAGE_BACKEND`. No code changes have landed yet.
+- **`doc/plans/`** — six implementation plans (A–F) breaking the ZFS backend into independently-landable slices. Start with `doc/plans/README.md` for the index and recommended landing order (A → E → F → B → C → D). Plans add a new sourced module `src/storage_zfs.sh` (under a `zfs::` namespace) and branch in `src/runtime.sh`, `src/docker.sh` on `ENROOT_STORAGE_BACKEND`. **Plan A is implemented** on `feature/zfs-foundation` (PR [zeroae/enroot#1](https://github.com/zeroae/enroot/pull/1) → `zenroot/main`); B–F are still design-only.
 
 ## Conventions
 
@@ -82,3 +82,33 @@ When debugging container behavior, the order is: image `/etc/{rc,fstab,environme
 ## Contributing
 
 Every commit must be DCO-signed (`git commit -s`). See `CONTRIBUTING.md`. There is no separate code-style or PR-template doc.
+
+## Fork workflow (zeroae/enroot)
+
+This working copy is a fork. Changes are **not destined for upstream merge** — `nvidia/enroot` is treated as a read-only source we periodically absorb from. The fork lives at `https://github.com/zeroae/enroot`.
+
+**Remotes:**
+- `origin` → `https://github.com/zeroae/enroot.git` — the fork; push here.
+- `upstream` → `https://github.com/nvidia/enroot.git` — read-only; never push.
+
+**Branches:**
+- `main` — local mirror of `upstream/main`. Never commit here directly. Refresh with `git fetch upstream && git push origin upstream/main:main`.
+- `zenroot/main` — the **fork's default branch** and integration line. All feature work lands here. Periodically rebased onto `upstream/main` (see below).
+- `feature/<name>` — short-lived. Branch off `zenroot/main`, PR back into `zenroot/main`, delete after merge.
+
+**Opening a PR** (after pushing the feature branch):
+```sh
+gh pr create --base zenroot/main --head feature/<name> --title "..." --body "..."
+```
+`zenroot/main` is the fork's default branch, so `--base` can usually be omitted, but state it explicitly to guard against accidental upstream targeting.
+
+**Absorbing upstream changes** — do this from `zenroot/main`, never on a live feature branch:
+```sh
+git checkout zenroot/main
+git fetch upstream
+git rebase upstream/main             # resolve conflicts here once
+git push --force-with-lease origin zenroot/main
+```
+Force-push is acceptable on `zenroot/main` because it's the integration branch. **Never force-push** a `feature/*` branch once it's under review; rebase only before opening the PR. If a feature branch needs to absorb the latest `zenroot/main` mid-review, prefer a merge commit over a rebase.
+
+**Plan stack:** the six plans in `doc/plans/` each map to one PR into `zenroot/main`. Recommended order is `A → E → F → B → C → D`; B/C/D/E/F all depend on A. After each plan merges, branch the next one from the freshly-merged `zenroot/main`.
