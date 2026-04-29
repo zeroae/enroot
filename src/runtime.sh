@@ -573,24 +573,44 @@ runtime::load() {
 }
 
 runtime::export() {
-    local rootfs="$1" filename="$2"
-    local exclude=()
+    local rootfs_name="$1" filename="$2" format="${3:-sqsh}"
+
+    if [ -z "${rootfs_name}" ]; then
+        common::err "Invalid argument"
+    fi
+    if [[ "${rootfs_name}" == */* ]]; then
+        common::err "Invalid argument: ${rootfs_name}"
+    fi
+
+    case "${format}" in
+        sqsh) ;;
+        zfs)
+            if ! zfs::enabled; then
+                common::err "--format=zfs requires ENROOT_STORAGE_BACKEND=zfs"
+            fi
+            ;;
+        *) common::err "Invalid format: ${format}" ;;
+    esac
+
+    if [ "${format}" = "sqsh" ]; then
+        runtime::_export_sqsh "${rootfs_name}" "${filename}"
+    else
+        runtime::_export_zfs "${rootfs_name}" "${filename}"
+    fi
+}
+
+runtime::_export_sqsh() {
+    local -r rootfs_name="$1"
+    local filename="$2"
+    local rootfs exclude=()
 
     common::checkcmd mksquashfs
 
-    # Resolve the container rootfs path.
-    if [ -z "${rootfs}" ]; then
-        common::err "Invalid argument"
-    fi
-    if [[ "${rootfs}" == */* ]]; then
-        common::err "Invalid argument: ${rootfs}"
-    fi
-    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs}")
+    rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
     if [ ! -d "${rootfs}" ]; then
         common::err "No such file or directory: ${rootfs}"
     fi
 
-    # Generate an absolute filename if none was specified.
     if [ -z "${filename}" ]; then
         filename="$(basename "${rootfs}").sqsh"
     fi
@@ -612,10 +632,29 @@ runtime::export() {
         exclude+=("${rootfs}${lock_file}")
     fi
 
-    # Export a container image from the rootfs specified.
     common::log INFO "Creating squashfs filesystem..." NL
     mksquashfs "${rootfs}" "${filename}" -all-root ${TTY_OFF+-no-progress} -processors "${ENROOT_MAX_PROCESSORS}" \
       ${ENROOT_SQUASH_OPTIONS} ${exclude[@]+-e "${exclude[@]}"} >&2
+}
+
+runtime::_export_zfs() {
+    local -r rootfs_name="$1"
+    local filename="$2"
+
+    if [ -z "${filename}" ]; then
+        filename="${rootfs_name}.zfs"
+    fi
+    filename=$(common::realpath "${filename}")
+    if [ -e "${filename}" ]; then
+        if [ -z "${ENROOT_FORCE_OVERRIDE-}" ]; then
+            common::err "File already exists: ${filename}"
+        else
+            rm -f "${filename}"
+        fi
+    fi
+
+    common::log INFO "Creating zfs send stream..." NL
+    zfs::send_stream "${rootfs_name}" "${filename}"
 }
 
 runtime::list() {
