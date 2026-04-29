@@ -1,3 +1,12 @@
+#PACKAGE# (4.1.2.zfs.1-1) UNRELEASED; urgency=medium
+
+  * Add optional ZFS storage backend (ENROOT_STORAGE_BACKEND=zfs).
+    Implements clone-on-create, ephemeral-start, Docker layer
+    materialization, template warm/cold lifecycle, .zfs image
+    format, and zfs:// SSH transport. See doc/zfs.md.
+
+ -- #USERNAME# <#EMAIL#>  Wed, 29 Apr 2026 12:00:00 +0000
+
 #PACKAGE# (4.1.2-1) UNRELEASED; urgency=medium
 
   * Release v4.1.2
