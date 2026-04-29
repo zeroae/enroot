@@ -262,6 +262,87 @@ zfs::container_check() {
     fi
 }
 
+# Materializes a template from a zfs send stream file. The cache key is the
+# sha256 of the stream file (same scheme as the .sqsh path). Atomic via a
+# .tmp dataset; integrates with the same eviction sweep as ensure_template.
+zfs::ensure_template_from_stream() {
+    local -r stream="$1" sha="$2"
+    local -r store=$(zfs::store_dataset)
+    local -r template="${store}/${zfs_template_subdir}/${sha}"
+    local -r tmp="${template}.tmp"
+    local -r snap="${template}@${zfs_pristine_snap}"
+    local i timeout=600
+
+    zfs::sweep_templates
+
+    # Fast path: already cached.
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        zfs::touch_template "${template}"
+        printf "%s" "${template}"
+        return
+    fi
+
+    # Ensure the templates parent exists before receive (zfs receive does not
+    # auto-create parents).
+    zfs create -p "${store}/${zfs_template_subdir}" 2> /dev/null || :
+
+    if zfs receive -F "${tmp}" < "${stream}" 2> /dev/null; then
+        # The received dataset brings its own snapshot. Rename the dataset to
+        # the final template name; if the recv'd snapshot wasn't already named
+        # @pristine, alias it.
+        zfs rename "${tmp}" "${template}"
+        if ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+            local recvd_snap
+            recvd_snap=$(zfs list -H -t snapshot -o name -r -d 1 "${template}" | head -1)
+            [ -n "${recvd_snap}" ] && zfs rename "${recvd_snap}" "${snap}"
+        fi
+        zfs set readonly=on "${template}"
+        zfs::touch_template "${template}"
+        printf "%s" "${template}"
+        return
+    fi
+
+    # Receive failed. Clean our orphan .tmp (if any) and wait for another
+    # writer's @pristine.
+    zfs destroy -r "${tmp}" 2> /dev/null || :
+    for ((i = 0; i < timeout; i++)); do
+        if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+            printf "%s" "${template}"
+            return
+        fi
+        sleep 1
+    done
+    common::err "Timed out waiting for stream receive: ${template}"
+}
+
+# Sends a clone's @pristine snapshot (or a fresh snapshot if the container is
+# not a clone) to stdout. Used by --format=zfs export.
+zfs::send_stream() {
+    local -r name="$1" filename="$2"
+    local -r store=$(zfs::store_dataset)
+    local -r target="${store}/${name}"
+    local origin
+
+    if ! zfs list -H "${target}" > /dev/null 2>&1; then
+        common::err "No such container: ${name}"
+    fi
+
+    origin=$(zfs get -H -o value origin "${target}")
+    if [ -z "${origin}" ] || [ "${origin}" = "-" ]; then
+        # Not a clone — must take a fresh snapshot of the live dataset.
+        local snap="${target}@enroot-export-$$"
+        zfs snapshot "${snap}"
+        if ! zfs send "${snap}" > "${filename}"; then
+            zfs destroy "${snap}" 2> /dev/null || :
+            common::err "Failed to send stream for ${name}"
+        fi
+        zfs destroy "${snap}" 2> /dev/null || :
+    else
+        zfs send "${origin}" > "${filename}" \
+          || common::err "Failed to send stream for ${name}"
+    fi
+}
+
 # Materializes the merged Docker rootfs into a ZFS template (cached by
 # cache_key) and clones it as the user's named container. Designed to be
 # called from docker::load AFTER docker::_prepare_layers has populated the
