@@ -101,6 +101,8 @@ config::export ENROOT_BUNDLE_ALL       false
 config::export ENROOT_BUNDLE_CHECKSUM  false
 config::export ENROOT_FORCE_OVERRIDE   false
 config::export ENROOT_STORAGE_BACKEND  "dir"
+config::export ENROOT_TEMPLATE_WARM_SECONDS    604800
+config::export ENROOT_TEMPLATE_PRESSURE_THRESHOLD 80
 
 config::fini
 

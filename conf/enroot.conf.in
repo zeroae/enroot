@@ -26,6 +26,16 @@
 # create/mount/clone/destroy/snapshot delegations granted to the user. See doc/zfs.md.
 #ENROOT_STORAGE_BACKEND     dir
 
+# How long (seconds) a ZFS template with no clones stays evictable only under
+# disk pressure. 0 = evict immediately when the last clone goes away
+# (refcount-only). Default: 7 days.
+#ENROOT_TEMPLATE_WARM_SECONDS    604800
+
+# Quota fraction (0-100) above which routine "enroot create" / "enroot load"
+# starts evicting warm templates LRU until back under threshold. Soft signal;
+# the ZFS quota on the templates dataset is the hard wall.
+#ENROOT_TEMPLATE_PRESSURE_THRESHOLD 80
+
 # Remap the current user to root inside containers by default.
 #ENROOT_REMAP_ROOT          no
 
