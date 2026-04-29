@@ -40,6 +40,16 @@ zfs::checkenv() {
     zfs::store_dataset > /dev/null
 }
 
+# Updates the enroot:last_used user property on a template dataset to now.
+# Used by the eviction sweep to distinguish warm (recently-used) templates
+# from cold (idle past ENROOT_TEMPLATE_WARM_SECONDS) ones. Best-effort: a
+# read-only template (set by ensure_template) is touched via -o so the
+# readonly property doesn't block the metadata update.
+zfs::touch_template() {
+    local -r template="$1"
+    zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
+}
+
 # Computes the sha256 of a squashfs image file. Used as the template cache key.
 zfs::image_sha256() {
     local -r image="$1"
@@ -60,6 +70,7 @@ zfs::ensure_template() {
 
     # Fast path: template already exists with @pristine.
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
     fi
@@ -76,6 +87,7 @@ zfs::ensure_template() {
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
+        zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
     fi
@@ -203,6 +215,7 @@ zfs::docker_install_from_layers() {
 
     if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
         common::log INFO "Reusing cached template ${cache_key:0:12}"
+        zfs::touch_template "${template}"
     elif zfs create -p "${tmp}" 2> /dev/null; then
         mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
         mkdir -p rootfs
@@ -215,6 +228,7 @@ zfs::docker_install_from_layers() {
         zfs rename "${tmp}" "${template}"
         zfs snapshot "${snap}"
         zfs set readonly=on "${template}"
+        zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
         while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
