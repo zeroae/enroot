@@ -112,3 +112,81 @@ git push --force-with-lease origin zenroot/main
 Force-push is acceptable on `zenroot/main` because it's the integration branch. **Never force-push** a `feature/*` branch once it's under review; rebase only before opening the PR. If a feature branch needs to absorb the latest `zenroot/main` mid-review, prefer a merge commit over a rebase.
 
 **Plan stack:** the six plans in `doc/plans/` each map to one PR into `zenroot/main`. Recommended order is `A → E → F → B → C → D`; B/C/D/E/F all depend on A. After each plan merges, branch the next one from the freshly-merged `zenroot/main`.
+
+## Smoke-test cluster (Slurm + pyxis + ZFS)
+
+The fork is exercised end-to-end on a 3-node cluster: `spark-ctrl` (Pi 5, Debian 13, slurmctld + slurmdbd + MariaDB) and two compute nodes `spark-f2ff` and `spark-4c55` (DGX Spark GB10, Ubuntu 24.04, slurmd 25.11.5 + pyxis v0.23.0). Each compute node has a local ZFS pool `tank/enroot/data` mounted at `/var/lib/enroot` with the full delegation set (`create,mount,clone,destroy,snapshot,rename,promote,receive,readonly,hold,release,canmount,userprop`).
+
+The compute nodes are the "test harness" — pre-release `.deb`s get installed there for smoke validation, and back to the released version after.
+
+### Set up: install a pre-release build on the compute nodes
+
+```sh
+# 1. Build all flavors locally on the dev box.
+make clean
+rm -f ../enroot_*.orig.tar.* ../enroot-hardened_*.orig.tar.*
+CPPFLAGS="-DALLOW_SPECULATION -DINHERIT_FDS" make deb
+mkdir -p /tmp/release-stage && mv dist/* /tmp/release-stage/
+make deb PACKAGE=enroot-hardened
+mv /tmp/release-stage/* dist/
+CPPFLAGS="-DALLOW_SPECULATION -DINHERIT_FDS" make dist
+
+# 2. Push the standard .deb to each compute node and install non-interactively.
+for node in spark-f2ff spark-4c55; do
+    scp dist/enroot_${VERSION}-1_arm64.deb dist/enroot+caps_${VERSION}-1_arm64.deb "${node}":/tmp/
+    ssh "${node}" "sudo DEBIAN_FRONTEND=noninteractive dpkg --force-confnew \
+        -i /tmp/enroot_${VERSION}-1_arm64.deb /tmp/enroot+caps_${VERSION}-1_arm64.deb"
+done
+```
+
+> **Conffile gotcha:** `/etc/enroot/enroot.conf` is dpkg-managed. With `--force-confnew` the local edits get clobbered (saved to `enroot.conf.dpkg-old`). Restore the site config every time:
+> ```sh
+> ssh "${node}" 'sudo cp /etc/enroot/enroot.conf.dpkg-old /etc/enroot/enroot.conf'
+> ```
+> The site config sets `ENROOT_STORAGE_BACKEND zfs` and `ENROOT_DATA_PATH /var/lib/enroot`; without that the smoke tests fall back to the `dir` backend.
+
+### Smoke checks (typical script — adapt to whatever you're testing)
+
+The compute nodes share `${HOME}` over NFS, so commands run on the dev box can address them by hostname directly. `srun -w <node>` pins a job to a specific compute node.
+
+```sh
+# Pointer-format import + cache-hit create (issue #13 acceptance):
+ssh spark-f2ff '
+    rm -f /tmp/u.sqsh
+    enroot import -o /tmp/u.sqsh docker://ubuntu:24.04
+    head -1 /tmp/u.sqsh                                      # → enroot-zfs-image:v1
+    time enroot create -n u1 /tmp/u.sqsh                     # → subseconds (zfs clone)
+    enroot start u1 cat /etc/os-release | head -1
+    enroot remove -f u1; rm -f /tmp/u.sqsh
+'
+
+# Pyxis end-to-end (pin to a single node so both invocations share the cache):
+ssh spark-f2ff '
+    sudo zfs destroy -r tank/enroot/data/.templates/<sha>    # if you need a clean cold run
+    time srun -N1 -w spark-f2ff --container-image=docker://ubuntu:24.04 cat /etc/os-release
+    time srun -N1 -w spark-f2ff --container-image=docker://ubuntu:24.04 hostname
+'
+# Expected: only one new template under .templates/ after both runs;
+# the second invocation's create-step is subseconds (the issue's acceptance bar).
+
+# `--format=squashfs` opt-out — produces a real squashfs even on ZFS backend:
+ssh spark-f2ff '
+    enroot import --format=squashfs -o /tmp/u-real.sqsh docker://ubuntu:24.04
+    file /tmp/u-real.sqsh    # → Squashfs filesystem
+    rm -f /tmp/u-real.sqsh
+'
+```
+
+### Tear down: revert to the released version
+
+```sh
+for node in spark-f2ff spark-4c55; do
+    ssh "${node}" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-downgrades enroot=<released-version>-1 enroot+caps=<released-version>-1' \
+        || ssh "${node}" 'sudo dpkg -i /path/to/released/enroot_*.deb /path/to/released/enroot+caps_*.deb'
+    ssh "${node}" 'sudo cp /etc/enroot/enroot.conf.dpkg-old /etc/enroot/enroot.conf 2>/dev/null || :'
+    ssh "${node}" 'rm -f /tmp/enroot_*.deb /tmp/enroot+caps_*.deb /tmp/u*.sqsh /tmp/storage_zfs.sh'
+    ssh "${node}" 'enroot list 2>/dev/null | xargs -r -n1 enroot remove -f'
+done
+```
+
+If a smoke run left transient containers (`u1`, `u2`, …) or templates with no clones (`zfs list -H -d 1 -o name tank/enroot/data/.templates`), they auto-evict on the next `enroot create` per the warm/cold sweep — but you can also `sudo zfs destroy -r <template>` to force-clean immediately.
