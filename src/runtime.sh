@@ -541,7 +541,8 @@ runtime::digest() {
 }
 
 runtime::import() {
-    local -r uri="$1" filename="$2"
+    local -r uri="$1"
+    local filename="$2"
     local arch="$3"
 
     # Use the host architecture as the default.
@@ -552,7 +553,39 @@ runtime::import() {
     # Import a container image from the URI specified.
     case "${uri}" in
     docker://*)
-        docker::import "${uri}" "${filename}" "${arch}" ;;
+        if zfs::pointer_format_active; then
+            # ZFS pointer-format import: write a small magic-prefixed
+            # pointer file alongside populating the template cache.
+            # Filename defaulting follows docker::import (caller may
+            # leave $filename empty); we still produce a .sqsh-named
+            # file so pyxis hands it back to enroot create unchanged.
+            #
+            # Arch is passed RAW (uname -m form) to zfs::import_docker_pointer;
+            # that function normalizes via common::debarch internally — same
+            # convention as docker::import / docker::load, which is critical
+            # because common::debarch only accepts raw forms.
+            if [ -z "${filename}" ]; then
+                # Mirror docker::import's filename derivation. Re-parse
+                # the URI here to compute the default name. Filename
+                # derivation does not depend on arch.
+                local _user= _registry= _image= _tag=
+                docker::_parse_uri "${uri}" \
+                  | { common::read -r _user; common::read -r _registry; common::read -r _image; common::read -r _tag; }
+                local _display_image="${_image}"
+                if [[ "${_registry}" == "registry-1.docker.io" && "${_image}" == library/* ]]; then
+                    _display_image="${_image#library/}"
+                fi
+                filename="${_display_image////+}${_tag:++${_tag}}.sqsh"
+            fi
+            filename=$(common::realpath "${filename}")
+            if [ -e "${filename}" ]; then
+                common::err "File already exists: ${filename}"
+            fi
+            zfs::import_docker_pointer "${uri}" "${filename}" "${arch}"
+        else
+            docker::import "${uri}" "${filename}" "${arch}"
+        fi
+        ;;
     dockerd://* | podman://*)
         docker::daemon::import "${uri}" "${filename}" "${arch}" ;;
     zfs://*)
