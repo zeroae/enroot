@@ -36,6 +36,14 @@
 # the ZFS quota on the templates dataset is the hard wall.
 #ENROOT_TEMPLATE_PRESSURE_THRESHOLD 80
 
+# Format produced by `enroot import docker://...` when the ZFS storage
+# backend is active. "pointer" (default) writes a small pointer file
+# and populates the template cache as a side effect — repeat imports
+# of the same image hit the cache. "squashfs" forces a legacy real
+# .sqsh artifact. Ignored on the dir backend. Override per-invocation
+# with `enroot import --format=...`.
+#ENROOT_ZFS_IMPORT_FORMAT    pointer
+
 # Remap the current user to root inside containers by default.
 #ENROOT_REMAP_ROOT          no
 

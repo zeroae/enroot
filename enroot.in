@@ -189,6 +189,7 @@ enroot::usage() {
 
 		 Options:
 		   -a, --arch    Architecture of the image (defaults to host architecture)
+		   -f, --format  Output format ("pointer" or "squashfs"). On the ZFS backend, "pointer" (default) writes a small pointer file and populates the template cache; "squashfs" forces a real .sqsh. Ignored on the dir backend.
 		   -o, --output  Name of the output image file (defaults to "URI.sqsh" or "URI.zfs" for zfs://)
 		EOF
         ;;
@@ -389,6 +390,16 @@ enroot::import() {
         --name=*)
             [ -z "${1#*=}" ] && enroot::usage import 1
             name="${1#*=}"
+            shift
+            ;;
+        -f|--format)
+            [ -z "${2-}" ] && enroot::usage import 1
+            export ENROOT_ZFS_IMPORT_FORMAT="$2"
+            shift 2
+            ;;
+        --format=*)
+            [ -z "${1#*=}" ] && enroot::usage import 1
+            export ENROOT_ZFS_IMPORT_FORMAT="${1#*=}"
             shift
             ;;
         --zfs-recv)

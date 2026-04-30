@@ -50,6 +50,15 @@ zfs::touch_template() {
     zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
 }
 
+# Returns 0 iff a fully-materialized template (with @pristine snapshot) exists
+# for the given cache_key. Cheap predicate; does not run the eviction sweep.
+zfs::template_exists() {
+    local -r cache_key="$1"
+    local store
+    store=$(zfs::store_dataset)
+    zfs list -H -t snapshot "${store}/${zfs_template_subdir}/${cache_key}@${zfs_pristine_snap}" > /dev/null 2>&1
+}
+
 # Prints "<dataset>\t<last_used_epoch>" for each evictable template, sorted
 # oldest-first. A template is evictable iff it has @pristine and that snapshot
 # has no clones referencing it. Datasets without a last_used property report
@@ -126,6 +135,124 @@ zfs::sweep_templates() {
 zfs::image_sha256() {
     local -r image="$1"
     sha256sum "${image}" | awk '{print $1}'
+}
+
+# Pointer file format: a small plain-text artifact written by
+# enroot import docker://... when the ZFS backend is active. It carries
+# the stable image-config-sha256 (the cache key used by
+# zfs::_install_template_from_layers) plus enough metadata to recover from
+# template eviction by re-pulling from the registry. Filename stays .sqsh
+# so pyxis (which feeds the path back to enroot create unchanged) is
+# unaware of the format change. enroot create magic-byte-sniffs the first
+# 19 bytes (`enroot-zfs-image:v1`) and dispatches to the pointer path.
+readonly zfs_pointer_magic="enroot-zfs-image:v1"
+
+# Returns 0 if the ZFS backend is active AND ENROOT_ZFS_IMPORT_FORMAT is
+# unset or set to "pointer". Returns 1 otherwise (e.g. "squashfs" opt-out
+# or dir backend). Callers gate the new pointer-import path on this.
+zfs::pointer_format_active() {
+    zfs::enabled || return 1
+    case "${ENROOT_ZFS_IMPORT_FORMAT-pointer}" in
+        pointer) return 0 ;;
+        squashfs) return 1 ;;
+        *) common::err "Invalid ENROOT_ZFS_IMPORT_FORMAT: ${ENROOT_ZFS_IMPORT_FORMAT} (expected pointer or squashfs)" ;;
+    esac
+}
+
+# Returns 0 iff the file at $1 starts with the pointer magic line. Reads
+# only the first 19 bytes; never reads beyond. Safe on regular files,
+# squashfs blobs, ZFS send streams, and short/empty files. Uses cmp
+# directly rather than `head=$(dd ...)`-and-compare so binary inputs
+# don't trigger bash's "ignored null byte in input" warning on the
+# command substitution.
+zfs::is_pointer() {
+    local -r path="$1"
+    [ -f "${path}" ] || return 1
+    printf '%s' "${zfs_pointer_magic}" | cmp -s -n 19 - "${path}"
+}
+
+# Atomically writes a pointer file at $1 with the given fields. Uses
+# tmp + rename so partial writes never leave a half-formed pointer behind.
+# All inputs are validated; refuses to write a pointer with a malformed
+# config_sha or manifest_digest.
+zfs::write_pointer() {
+    local -r output="$1" config_sha="$2" manifest_digest="$3" arch="$4" uri="$5"
+    local tmp imported
+
+    # Strict regexes here are not just sanity checks — read_pointer prints
+    # KEY=VALUE pairs that callers consume via eval. Any value that flows
+    # into eval must be free of shell metacharacters ($, `, ;, (, ), |, &,
+    # space, newline, etc.). The character classes below all forbid them.
+    [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
+      || common::err "zfs::write_pointer: invalid image-config-sha256: ${config_sha}"
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
+      || common::err "zfs::write_pointer: invalid arch: ${arch}"
+    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+      || common::err "zfs::write_pointer: invalid uri: ${uri}"
+
+    imported=$(date -u +%FT%TZ)
+    tmp="${output}.tmp.$$"
+    {
+        printf "%s\n" "${zfs_pointer_magic}"
+        printf "image-config-sha256=%s\n" "${config_sha}"
+        printf "manifest-digest=%s\n" "${manifest_digest}"
+        printf "arch=%s\n" "${arch}"
+        printf "uri=%s\n" "${uri}"
+        printf "imported=%s\n" "${imported}"
+    } > "${tmp}" || { rm -f "${tmp}" 2> /dev/null || :; common::err "Failed to write pointer ${output}"; }
+    mv -f "${tmp}" "${output}"
+}
+
+# Parses a pointer file and prints the recognized fields, one per line, as
+# KEY=VALUE pairs (suitable for `eval`-style consumption — the values
+# themselves are validated against strict regexes so no shell-metachar
+# escape is needed). Errors if the magic line is missing or any required
+# field fails validation.
+zfs::read_pointer() {
+    local -r path="$1"
+    local line key value config_sha= manifest_digest= arch= uri= imported=
+
+    common::read -r line < "${path}"
+    [ "${line}" = "${zfs_pointer_magic}" ] \
+      || common::err "Not a ZFS pointer file: ${path}"
+
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            image-config-sha256) config_sha="${value}" ;;
+            manifest-digest)     manifest_digest="${value}" ;;
+            arch)                arch="${value}" ;;
+            uri)                 uri="${value}" ;;
+            imported)            imported="${value}" ;;
+            "")                  : ;;  # blank line
+            *) : ;;                    # forward-compatible: ignore unknown
+        esac
+    done < <(tail -n +2 "${path}")
+
+    # All five fields are validated against strict regexes before output —
+    # the caller will eval the printed KEY=VALUE pairs, so values must be
+    # free of shell metacharacters. The classes below all forbid them.
+    [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
+      || common::err "Pointer ${path} missing/invalid image-config-sha256"
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "Pointer ${path} missing/invalid manifest-digest"
+    [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
+      || common::err "Pointer ${path} missing/invalid arch"
+    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+      || common::err "Pointer ${path} missing/invalid uri"
+    [[ "${imported}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+      || common::err "Pointer ${path} missing/invalid imported timestamp"
+
+    # Emit shell-friendly names (underscores, not hyphens) so the caller
+    # can `eval` the output directly. The on-disk pointer format keeps
+    # the docker-conventional hyphenated names; this is just the eval
+    # interface.
+    printf "image_config_sha256=%s\n" "${config_sha}"
+    printf "manifest_digest=%s\n"     "${manifest_digest}"
+    printf "arch=%s\n"                "${arch}"
+    printf "uri=%s\n"                 "${uri}"
+    printf "imported=%s\n"            "${imported}"
 }
 
 # Ensures a template dataset exists for the given image hash, extracting if needed.
@@ -571,21 +698,22 @@ zfs::send_stream() {
 }
 
 # Materializes the merged Docker rootfs into a ZFS template (cached by
-# cache_key) and clones it as the user's named container. Designed to be
-# called from docker::load AFTER docker::_prepare_layers has populated the
-# cwd with extracted, whiteout-converted layer directories 0/, 1/, ..., N/.
+# cache_key). Designed to be called from docker::load (or the pointer-import
+# flow) AFTER docker::_prepare_layers has populated the cwd with extracted,
+# whiteout-converted layer directories 0/, 1/, ..., N/.
 #
 # Inputs:
 #   $1 cache_key   - sha256 of the image config blob (a stable per-image key)
 #   $2 layer_count - the N from _prepare_layers (count of layer directories)
 #   $3 unpriv      - "y" or "" — whether to enter a new user namespace
-#   $4 name        - the user-visible container name (no slashes)
+#
+# Outputs: prints the template dataset path to stdout (no trailing newline).
 #
 # Atomicity: races on the same cache_key are resolved via a per-key .tmp
 # dataset lock; losers wait for @pristine. ENOSPC mid-merge destroys the
 # .tmp so a retry can run.
-zfs::docker_install_from_layers() {
-    local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+zfs::_install_template_from_layers() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3"
     local store template tmp snap mountpoint i=0
     store=$(zfs::store_dataset)
     template="${store}/${zfs_template_subdir}/${cache_key}"
@@ -622,7 +750,12 @@ zfs::docker_install_from_layers() {
         zfs rename "${tmp}" "${template}"
         enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
-        zfs set readonly=on "${template}"
+        # `zfs set readonly=on` triggers an implicit remount that needs
+        # CAP_SYS_ADMIN; for unprivileged callers the property is set but
+        # the remount fails and zfs(8) exits non-zero. Suppress both the
+        # warning and the non-zero exit — what we actually care about
+        # (the property bit) is set regardless of the remount.
+        zfs set readonly=on "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
@@ -632,5 +765,150 @@ zfs::docker_install_from_layers() {
         done
     fi
 
+    printf "%s" "${template}"
+}
+
+# Backwards-compatible wrapper: install the template (or wait for one) and
+# clone it into the user-visible container name. This is what existing callers
+# (docker::load) use.
+zfs::docker_install_from_layers() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+    local template
+    template=$(zfs::_install_template_from_layers "${cache_key}" "${layer_count}" "${unpriv}")
     zfs::clone_container "${template}" "${name}"
 }
+
+# Import flow for docker:// URIs when the ZFS backend is active and the
+# pointer format is selected. Pulls layers (via docker::_prepare_layers),
+# fetches the manifest digest (via docker::digest), populates the
+# layer-keyed template cache (via zfs::_install_template_from_layers),
+# and writes a pointer file at output_path. Skips mksquashfs entirely.
+#
+# Counterpart of docker::import for the pointer flow. Modeled on
+# docker::load (which uses the same layer-pull + template-install
+# combination for direct enroot create docker://X).
+#
+# Inputs:
+#   $1 uri          - docker://[USER@]REGISTRY[:PORT]/IMAGE[:TAG]
+#   $2 output_path  - where to write the pointer (caller pre-validated)
+#   $3 arch         - raw uname -m form (e.g. "aarch64"); normalized internally
+#                     via common::debarch, same convention as docker::import /
+#                     docker::load. Empty means "skip arch validation".
+#
+# Subshell function (parens) so cwd and EXIT trap stay scoped to this call —
+# matches docker::import / docker::load.
+zfs::import_docker_pointer() (
+    local -r uri="$1" output_path="$2"
+    local arch="$3"
+    local config_sha= manifest_digest=
+
+    set -euo pipefail
+
+    # Fetch the manifest digest first (cheap HEAD on the manifest URL).
+    # docker::digest takes raw arch and normalizes internally — pass it
+    # the unmodified caller-supplied arch.
+    manifest_digest=$(docker::digest "${uri}" "${arch}")
+    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "registry returned invalid manifest digest: ${manifest_digest}"
+
+    # Convert the architecture to the debian format for the internal
+    # helpers. _pull_and_install_template expects already-normalized arch.
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
+
+    config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+
+    zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
+)
+
+# Create flow for a ZFS pointer file. Reads the pointer, then either:
+# (a) clones an already-cached template on hit, or
+# (b) re-pulls from the pointer's URI to repopulate an evicted template,
+#     then clones. The freshly-pulled image-config-sha256 must match the
+#     pointer's claim — otherwise the registry tag has been republished
+#     and the pointer is stale.
+#
+# Inputs:
+#   $1 pointer_path  - validated pointer file (caller already passed
+#                      zfs::is_pointer)
+#   $2 name          - user-visible container name (no slashes)
+zfs::create_from_pointer() (
+    local -r pointer_path="$1" name="$2"
+    local fresh_config_sha
+    local image_config_sha256= manifest_digest= arch= uri= imported=
+    local store template
+
+    set -euo pipefail
+
+    zfs::checkenv
+
+    # Parse the pointer (read_pointer validates each field against strict
+    # regexes; safe to eval).
+    eval "$(zfs::read_pointer "${pointer_path}")"
+
+    if zfs::template_exists "${image_config_sha256}"; then
+        store=$(zfs::store_dataset)
+        template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+        zfs::touch_template "${template}"
+        zfs::clone_container "${template}" "${name}"
+        return
+    fi
+
+    # Eviction recovery: re-pull from the registry. The new
+    # image-config-sha256 must match the pointer's claim; mismatch means
+    # the upstream tag has been republished, which we surface as a clear
+    # error rather than silently cloning a different image.
+    common::log INFO "Template ${image_config_sha256:0:12} evicted; re-pulling from ${uri}"
+    # The pointer's `arch` is already debian-normalized (write_pointer
+    # was given the normalized form), so pass it straight through to the
+    # puller, which expects normalized.
+    fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+    if [ "${fresh_config_sha}" != "${image_config_sha256}" ]; then
+        common::err "Pointer ${pointer_path} references image-config-sha256 ${image_config_sha256:0:12}, but ${uri} now resolves to ${fresh_config_sha:0:12}. Delete and re-import."
+    fi
+
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+    zfs::clone_container "${template}" "${name}"
+)
+
+# Internal helper used by both the import flow's recovery path and (via
+# zfs::import_docker_pointer) the main import flow. Pulls layers and
+# installs the template; prints the resolved image-config-sha256 so the
+# caller can validate it. Does NOT write a pointer file.
+#
+# Inputs:
+#   $1 uri    - docker:// URI
+#   $2 arch   - ALREADY debarch-normalized (callers must convert with
+#               common::debarch first, or pass through the value already
+#               stored in a pointer file).
+#
+# Subshell function for cwd / EXIT trap scoping (see import_docker_pointer
+# for the same rationale).
+zfs::_pull_and_install_template() (
+    local -r uri="$1" arch="$2"
+    local user= registry= image= tag= tmpdir= config= layer_count= unpriv=
+
+    set -euo pipefail
+
+    common::checkcmd curl grep awk jq parallel tar "${ENROOT_GZIP_PROGRAM}" find zstd
+
+    docker::_parse_uri "${uri}" \
+      | { common::read -r user; common::read -r registry; common::read -r image; common::read -r tag; }
+
+    trap 'common::rmall "${tmpdir}" 2> /dev/null; rm -f "${token_dir}"/*.$$ 2> /dev/null' EXIT
+    tmpdir=$(common::mktmpdir enroot)
+    common::chdir "${tmpdir}"
+
+    ENROOT_SET_USER_XATTRS=y docker::_prepare_layers "${user}" "${registry}" "${image}" "${tag}" "${arch}" \
+      | { common::read -r config; common::read -r layer_count; }
+
+    if [ "${EUID}" -ne 0 ]; then
+        unpriv=y
+    fi
+
+    zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
+
+    printf "%s" "${config}"
+)

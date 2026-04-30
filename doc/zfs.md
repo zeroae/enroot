@@ -61,6 +61,63 @@ A `.zfs` file is a `zfs send` stream — not a mountable filesystem, not portabl
 
 The dispatcher picks the path by file extension. There is no magic-byte sniffing; `.sqsh` is always squashfs and `.zfs` is always a stream.
 
+## Pointer-format import (default on ZFS backend)
+
+When `ENROOT_STORAGE_BACKEND=zfs`, `enroot import docker://<ref>` writes a
+small (< 1 KiB) **pointer file** instead of a real squashfs image. The pointer
+carries the docker manifest digest and the `image-config-sha256` (the same
+stable cache key used by direct `enroot create docker://<ref>`). `enroot
+create` reads the pointer and clones the cached template — `O(zfs clone)`,
+subseconds — instead of running `unsquashfs`. Repeat imports of the same
+image hit the existing template cache, even though each `enroot import`
+otherwise produces a non-deterministic squashfs (timestamps and per-build
+metadata leak through `mksquashfs`).
+
+Pointer files are recognizable by their first line:
+
+```
+enroot-zfs-image:v1
+image-config-sha256=<64-hex>
+manifest-digest=sha256:<64-hex>
+arch=arm64
+uri=docker://registry-1.docker.io/library/ubuntu:24.04
+imported=2026-04-29T18:23:11Z
+```
+
+Pyxis treats the file as opaque (writes to a per-uid runtime dir, deletes it
+after `enroot create`), so the format change is invisible to pyxis.
+
+### Opting out
+
+Set `ENROOT_ZFS_IMPORT_FORMAT=squashfs` in the environment or the config
+file to force the legacy behavior (real `.sqsh`). The same effect is reachable
+per-invocation via `enroot import --format=squashfs docker://<ref>`. Use this
+when you need a portable squashfs artifact (e.g. to copy across nodes that
+don't share a ZFS pool).
+
+### Eviction recovery
+
+Templates are reaped by the existing warm/cold sweep on each `enroot create`
+(see `ENROOT_TEMPLATE_WARM_SECONDS` and `ENROOT_TEMPLATE_PRESSURE_THRESHOLD`).
+If the pointer's referenced template was evicted between import and create,
+`enroot create` re-pulls from the pointer's `uri` and validates that the
+freshly-resolved `image-config-sha256` still matches the pointer's claim. If
+the upstream tag has been republished (different config sha), `enroot create`
+errors out with a "delete and re-import" message — silently substituting a
+different image would defeat the whole point of content-addressing the cache.
+
+### Cross-node portability
+
+A pointer file references a template that lives in the importing node's ZFS
+pool. Pointers are not portable to other nodes (the referenced template will
+not exist there). For multi-node workflows:
+
+- Per-node pointer imports — let each node import its own pointer; the cache
+  and the work both stay local. This is what pyxis already does.
+- `--format=squashfs` — produce a real squashfs, copy it.
+- The existing `zfs://<host>/<name>` send-stream transport — push a populated
+  template to a peer over SSH.
+
 ### `enroot remove`
 
 Destroys the user's clone:
