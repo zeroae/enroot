@@ -1,3 +1,15 @@
+#PACKAGE# (4.1.2.zfs.4-1) UNRELEASED; urgency=medium
+
+  * Add ZFS pointer-format import (default on ZFS backend). `enroot
+    import docker://<ref>` now writes a small pointer file and populates
+    the layer-keyed template cache, skipping `mksquashfs` entirely. Repeat
+    imports of the same image (e.g. pyxis-driven Slurm jobs) hit the cache
+    and `enroot create` becomes O(zfs clone). `--format=squashfs` or
+    `ENROOT_ZFS_IMPORT_FORMAT=squashfs` preserves the legacy behavior
+    (issue #13).
+
+ -- #USERNAME# <#EMAIL#>  Wed, 29 Apr 2026 21:00:00 +0000
+
 #PACKAGE# (4.1.2.zfs.3-1) UNRELEASED; urgency=medium
 
   * Replace `zfs clone -u` (added in OpenZFS 2.3) with `zfs clone -o
