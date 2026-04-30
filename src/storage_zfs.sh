@@ -243,8 +243,12 @@ zfs::read_pointer() {
     [[ "${imported}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
       || common::err "Pointer ${path} missing/invalid imported timestamp"
 
-    printf "image-config-sha256=%s\n" "${config_sha}"
-    printf "manifest-digest=%s\n"     "${manifest_digest}"
+    # Emit shell-friendly names (underscores, not hyphens) so the caller
+    # can `eval` the output directly. The on-disk pointer format keeps
+    # the docker-conventional hyphenated names; this is just the eval
+    # interface.
+    printf "image_config_sha256=%s\n" "${config_sha}"
+    printf "manifest_digest=%s\n"     "${manifest_digest}"
     printf "arch=%s\n"                "${arch}"
     printf "uri=%s\n"                 "${uri}"
     printf "imported=%s\n"            "${imported}"
