@@ -745,7 +745,12 @@ zfs::_install_template_from_layers() {
         zfs rename "${tmp}" "${template}"
         enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
-        zfs set readonly=on "${template}"
+        # `zfs set readonly=on` triggers an implicit remount that needs
+        # CAP_SYS_ADMIN; for unprivileged callers the property is set but
+        # the remount fails and zfs(8) exits non-zero. Suppress both the
+        # warning and the non-zero exit — what we actually care about
+        # (the property bit) is set regardless of the remount.
+        zfs set readonly=on "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
