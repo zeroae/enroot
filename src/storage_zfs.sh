@@ -161,13 +161,14 @@ zfs::pointer_format_active() {
 
 # Returns 0 iff the file at $1 starts with the pointer magic line. Reads
 # only the first 19 bytes; never reads beyond. Safe on regular files,
-# squashfs blobs, ZFS send streams, and short/empty files.
+# squashfs blobs, ZFS send streams, and short/empty files. Uses cmp
+# directly rather than `head=$(dd ...)`-and-compare so binary inputs
+# don't trigger bash's "ignored null byte in input" warning on the
+# command substitution.
 zfs::is_pointer() {
     local -r path="$1"
-    local head
     [ -f "${path}" ] || return 1
-    head=$(dd if="${path}" bs=19 count=1 2> /dev/null) || return 1
-    [ "${head}" = "${zfs_pointer_magic}" ]
+    printf '%s' "${zfs_pointer_magic}" | cmp -s -n 19 - "${path}"
 }
 
 # Atomically writes a pointer file at $1 with the given fields. Uses
