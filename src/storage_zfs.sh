@@ -50,6 +50,21 @@ zfs::touch_template() {
     zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
 }
 
+# Stamps a template dataset with docker provenance properties so the
+# dataset is self-describing even after its (transient) pointer file is
+# gone. Always called from a context where the inputs have already been
+# regex-validated (write_pointer / read_pointer in zfs.4 — the callers
+# pass values that survived those regex gates), so we don't re-validate
+# here. Best-effort: any property set that fails (e.g. delegation
+# missing on an upgraded cluster) is silently ignored — the template
+# still functions; only the operator-visible metadata is degraded.
+zfs::set_template_metadata() {
+    local -r template="$1" uri="$2" manifest_digest="$3" arch="$4"
+    zfs set "enroot:uri=${uri}" "${template}" 2> /dev/null || :
+    zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    zfs set "enroot:arch=${arch}" "${template}" 2> /dev/null || :
+}
+
 # Returns 0 iff a fully-materialized template (with @pristine snapshot) exists
 # for the given cache_key. Cheap predicate; does not run the eviction sweep.
 zfs::template_exists() {
