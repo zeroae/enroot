@@ -840,6 +840,11 @@ zfs::import_docker_pointer() (
 
     config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
 
+    local store
+    store=$(zfs::store_dataset)
+    zfs::set_template_metadata "${store}/${zfs_template_subdir}/${config_sha}" \
+        "${uri}" "${manifest_digest}" "${arch}"
+
     zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
 )
 
@@ -891,6 +896,7 @@ zfs::create_from_pointer() (
 
     store=$(zfs::store_dataset)
     template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+    zfs::set_template_metadata "${template}" "${uri}" "${manifest_digest}" "${arch}"
     zfs::clone_container "${template}" "${name}"
 )
 
