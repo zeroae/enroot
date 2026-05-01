@@ -327,7 +327,9 @@ zfs::ensure_template() {
         zfs rename "${tmp}" "${template}"
         enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
-        zfs set readonly=on "${template}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
@@ -665,7 +667,9 @@ zfs::ensure_template_from_stream() {
             recvd_snap=$(zfs list -H -t snapshot -o name -r -d 1 "${template}" | head -1)
             [ -n "${recvd_snap}" ] && zfs rename "${recvd_snap}" "${snap}"
         fi
-        zfs set readonly=on "${template}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
@@ -771,6 +775,8 @@ zfs::_install_template_from_layers() {
         # warning and the non-zero exit — what we actually care about
         # (the property bit) is set regardless of the remount.
         zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
