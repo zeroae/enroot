@@ -224,6 +224,29 @@ A concurrent eviction can destroy a template's `@pristine` snapshot just as anot
 
 The pressure threshold is a soft signal, not a barrier. Two concurrent `create`s seeing "78% used" can both extract and overshoot — the ZFS quota refuses one with ENOSPC and the retry path catches it. The threshold prevents the common case; the quota is the hard wall.
 
+### Inspecting cached templates
+
+Each template dataset carries ZFS user properties recording when it was imported and (for docker-sourced templates) where it came from:
+
+| Property | Set on | Meaning |
+|---|---|---|
+| `enroot:imported` | every template | RFC3339 UTC timestamp of install |
+| `enroot:last_used` | every template, refreshed on each clone | epoch seconds, drives the warm/cold sweep |
+| `enroot:uri` | docker-sourced templates | the `docker://...` URI it was pulled from |
+| `enroot:manifest-digest` | docker-sourced templates | registry manifest digest at import time |
+| `enroot:arch` | docker-sourced templates | debian arch (`arm64`, `amd64`, `ppc64le`) |
+
+A one-liner to see what's cached:
+
+```sh
+zfs list -o name,enroot:uri,enroot:imported,enroot:last_used,used \
+         -r -d 1 ${POOL}/.templates
+```
+
+Properties are replicated by `zfs send -p`, so `enroot:uri` and friends survive the existing `zfs://<host>/<name>` SSH transport — a template pulled to one node carries its provenance to its peers.
+
+Idle templates are unmounted (zero mountpoints under `${ENROOT_DATA_PATH}/.templates`); only active container clones appear in `mount(8)` output. The dataset and its `@pristine` snapshot remain — `zfs clone` does not require the source to be mounted.
+
 ## Admin setup
 
 A site enabling the ZFS backend should:

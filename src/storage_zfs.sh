@@ -50,6 +50,21 @@ zfs::touch_template() {
     zfs set "enroot:last_used=$(date +%s)" "${template}" 2> /dev/null || :
 }
 
+# Stamps a template dataset with docker provenance properties so the
+# dataset is self-describing even after its (transient) pointer file is
+# gone. Always called from a context where the inputs have already been
+# regex-validated (write_pointer / read_pointer in zfs.4 — the callers
+# pass values that survived those regex gates), so we don't re-validate
+# here. Best-effort: any property set that fails (e.g. delegation
+# missing on an upgraded cluster) is silently ignored — the template
+# still functions; only the operator-visible metadata is degraded.
+zfs::set_template_metadata() {
+    local -r template="$1" uri="$2" manifest_digest="$3" arch="$4"
+    zfs set "enroot:uri=${uri}" "${template}" 2> /dev/null || :
+    zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    zfs set "enroot:arch=${arch}" "${template}" 2> /dev/null || :
+}
+
 # Returns 0 iff a fully-materialized template (with @pristine snapshot) exists
 # for the given cache_key. Cheap predicate; does not run the eviction sweep.
 zfs::template_exists() {
@@ -312,7 +327,9 @@ zfs::ensure_template() {
         zfs rename "${tmp}" "${template}"
         enroot-zfs-mount "${template}" 2> /dev/null || :
         zfs snapshot "${snap}"
-        zfs set readonly=on "${template}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
@@ -650,7 +667,9 @@ zfs::ensure_template_from_stream() {
             recvd_snap=$(zfs list -H -t snapshot -o name -r -d 1 "${template}" | head -1)
             [ -n "${recvd_snap}" ] && zfs rename "${recvd_snap}" "${snap}"
         fi
-        zfs set readonly=on "${template}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
         printf "%s" "${template}"
         return
@@ -756,6 +775,8 @@ zfs::_install_template_from_layers() {
         # warning and the non-zero exit — what we actually care about
         # (the property bit) is set regardless of the remount.
         zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
         zfs::touch_template "${template}"
     else
         # Lost the race or stale .tmp — wait for @pristine.
@@ -819,6 +840,11 @@ zfs::import_docker_pointer() (
 
     config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
 
+    local store
+    store=$(zfs::store_dataset)
+    zfs::set_template_metadata "${store}/${zfs_template_subdir}/${config_sha}" \
+        "${uri}" "${manifest_digest}" "${arch}"
+
     zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
 )
 
@@ -870,6 +896,7 @@ zfs::create_from_pointer() (
 
     store=$(zfs::store_dataset)
     template="${store}/${zfs_template_subdir}/${image_config_sha256}"
+    zfs::set_template_metadata "${template}" "${uri}" "${manifest_digest}" "${arch}"
     zfs::clone_container "${template}" "${name}"
 )
 
