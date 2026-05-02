@@ -811,6 +811,72 @@ zfs::docker_install_from_layers() {
     zfs::clone_container "${template}" "${name}"
 }
 
+# Materializes a flat rootfs directory tree into a ZFS template (cached
+# by cache_key). Counterpart of _install_template_from_layers for callers
+# that already have a single rootfs/ tree (e.g. the dockerd:// / podman://
+# import path, where `${engine} export | tar -x` produces a flat tree, not
+# layered overlayfs directories).
+#
+# Inputs:
+#   $1 cache_key   - sha256 of the image config (the daemon image ID)
+#   $2 source_dir  - directory containing the rootfs to install
+#   $3 unpriv      - "y" or "" — whether to enter a new user namespace
+#
+# Outputs: prints the template dataset path to stdout (no trailing newline).
+#
+# Atomicity: races on the same cache_key are resolved via a per-key .tmp
+# dataset lock; losers wait for @pristine. Same shape as
+# _install_template_from_layers.
+zfs::_install_template_from_dir() {
+    local -r cache_key="$1" source_dir="$2" unpriv="$3"
+    local store template tmp snap mountpoint i=0
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${cache_key}"
+    tmp="${template}.tmp"
+    snap="${template}@${zfs_pristine_snap}"
+
+    zfs::sweep_templates
+
+    zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
+
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        common::log INFO "Reusing cached template ${cache_key:0:12}"
+        zfs::touch_template "${template}"
+    elif zfs create -u "${tmp}" 2> /dev/null; then
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy "${tmp}" 2> /dev/null || :
+            common::err "failed to mount daemon template"
+        fi
+        mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+        local copy_cmd
+        copy_cmd="tar --numeric-owner -C '${source_dir}/' --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${copy_cmd}"; then
+            common::log WARN "Daemon template copy failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${copy_cmd}" \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Failed to copy daemon rootfs into ZFS template even after evicting warm templates"; }
+        fi
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
+        zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
+        zfs snapshot "${snap}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
+        zfs::touch_template "${template}"
+    else
+        # Lost the race or stale .tmp — wait for @pristine.
+        while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
+            sleep 1
+            ((i++ < 600)) || common::err "Timed out waiting for daemon template: ${template}"
+        done
+    fi
+
+    printf "%s" "${template}"
+}
+
 # Import flow for docker:// URIs when the ZFS backend is active and the
 # pointer format is selected. Pulls layers (via docker::_prepare_layers),
 # fetches the manifest digest (via docker::digest), populates the
