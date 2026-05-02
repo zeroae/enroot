@@ -19,6 +19,8 @@ source "${ENROOT_LIBRARY_PATH}/common.sh"
 readonly zfs_template_subdir=".templates"
 readonly zfs_pristine_snap="pristine"
 readonly zfs_ephemeral_subdir=".ephemeral"
+readonly zfs_layers_subdir=".layers"
+readonly zfs_layer_done_snap="done"
 
 # Returns 0 if the ZFS storage backend is configured, 1 otherwise.
 zfs::enabled() {
@@ -735,6 +737,59 @@ zfs::send_stream() {
         zfs send "${origin}" > "${filename}" \
           || common::err "Failed to send stream for ${name}"
     fi
+}
+
+# Generates the bash payload that applies one already-extracted layer
+# directory (post enroot-aufs2ovlfs, so whiteouts are mknod 0:0 char
+# devices and opaque dirs carry trusted.overlay.opaque=y) on top of an
+# already-merged target directory. Designed to be passed to
+# `enroot-nsenter --user --remap-root --mount bash -c`.
+#
+# Two placeholders @@LAYER@@ / @@TARGET@@ are sed-substituted at
+# generation time; both paths come from ZFS dataset mountpoints whose
+# names derive from regex-validated digests + ENROOT_DATA_PATH, so they
+# can't contain shell metacharacters. The payload itself uses single
+# quotes around the substituted paths and double quotes around the
+# loop-local `${var}` interpolations so a path containing whitespace
+# (rare but legal in mountpoints) does not break the apply.
+zfs::_apply_layer_payload() {
+    local -r layer_dir="$1" target_dir="$2"
+    sed -e "s#@@LAYER@@#${layer_dir}#g" -e "s#@@TARGET@@#${target_dir}#g" <<'PAYLOAD'
+set -euo pipefail
+mount --make-rprivate /
+cd '@@LAYER@@'
+
+# Phase 1: opaque-dir clearing. trusted.overlay.opaque=y on a layer dir
+# means "ignore everything from the parent in this dir"; we replicate
+# that by clearing the corresponding target dir's children before
+# layering this layer's contents on top.
+getfattr -R -h --absolute-names -n trusted.overlay.opaque . 2>/dev/null \
+  | awk -F': ' 'sub(/^# file: /, "")' \
+  | while IFS= read -r d; do
+        rel="${d#./}"
+        find '@@TARGET@@/'"${rel}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || :
+    done
+
+# Phase 2: whiteout deletion. Each char-device 0:0 in the layer encodes
+# "this path is removed in this layer". Be defensive — only treat 0:0
+# devices as whiteouts; any non-0:0 char dev (legitimate but unusual)
+# is left for phase 3 to copy forward.
+find . -type c | while IFS= read -r wh; do
+    [ "$(stat -c '%t-%T' "${wh}" 2>/dev/null)" = "0-0" ] || continue
+    rm -rf '@@TARGET@@/'"${wh#./}"
+done
+
+# Phase 3: tar-pipe non-whiteout contents into the target. xattrs
+# (overlayfs opaque markers, capability bits, SELinux labels) and ACLs
+# are preserved. Char devices are excluded — both the 0:0 whiteouts we
+# already actioned in phase 2 and any other char devs (which would not
+# be expected in Docker images post extraction).
+find . -type c -printf '%P\n' > /tmp/.enroot-excludes.$$
+tar -C . --exclude-from=/tmp/.enroot-excludes.$$ \
+    --xattrs --xattrs-include='*' --acls -cpf - . \
+  | tar -C '@@TARGET@@' --xattrs --xattrs-include='*' --acls -xpf -
+rm -f /tmp/.enroot-excludes.$$
+PAYLOAD
 }
 
 # Materializes the merged Docker rootfs into a ZFS template (cached by
