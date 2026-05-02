@@ -164,6 +164,15 @@ zfs::image_sha256() {
 # 19 bytes (`enroot-zfs-image:v1`) and dispatches to the pointer path.
 readonly zfs_pointer_magic="enroot-zfs-image:v1"
 
+# Returns 0 iff the ZFS backend is active AND ENROOT_ZFS_LAYER_CHAIN=y.
+# Callers gate the per-layer-clone-chain template-fill path on this. The
+# default-off behavior (unset / "" / anything but "y") preserves Plan F's
+# single-merge path byte-for-byte.
+zfs::layer_chain_active() {
+    zfs::enabled || return 1
+    [ "${ENROOT_ZFS_LAYER_CHAIN-}" = "y" ]
+}
+
 # Returns 0 if the ZFS backend is active AND ENROOT_ZFS_IMPORT_FORMAT is
 # unset or set to "pointer". Returns 1 otherwise (e.g. "squashfs" opt-out
 # or dir backend). Callers gate the new pointer-import path on this.
