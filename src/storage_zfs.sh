@@ -396,6 +396,22 @@ zfs::clone_container() {
     fi
 }
 
+# Idempotent-mount a named container's ZFS dataset. ZFS clones are created
+# with canmount=noauto so unprivileged callers don't trigger mount(2)
+# (which needs CAP_SYS_ADMIN) at create time — but that also makes
+# zfs mount -a skip them at boot, leaving the container's mountpoint
+# empty after a reboot. Call this before any path-based access of a
+# named container (start, export-sqsh, …) so the rootfs becomes visible
+# again. enroot-zfs-mount silently no-ops on already-mounted datasets,
+# so this is safe to call unconditionally. Best-effort: an absent
+# dataset is silently ignored; the caller will surface a clearer
+# "no such directory" error a moment later when the existence check
+# fails.
+zfs::ensure_container_mounted() {
+    local -r name="$1"
+    enroot-zfs-mount "$(zfs::store_dataset)/${name}" 2> /dev/null || :
+}
+
 # Destroys a user container. The clone's origin template is left in place;
 # its lifecycle is owned by zfs::sweep_templates (warm/cold/pressure-driven
 # eviction on next create), so a remove + re-create cycle within
