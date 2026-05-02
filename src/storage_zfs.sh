@@ -870,8 +870,18 @@ zfs::_install_template_from_layers() {
 # (docker::load) use.
 zfs::docker_install_from_layers() {
     local -r cache_key="$1" layer_count="$2" unpriv="$3" name="$4"
+    shift 4
     local template
-    template=$(zfs::_install_template_from_layers "${cache_key}" "${layer_count}" "${unpriv}")
+    # Variadic remaining args are layer digests (base first, top last);
+    # passed when the caller wants chain mode. Chain mode also requires
+    # ENROOT_ZFS_LAYER_CHAIN=y; if either gate fails we transparently
+    # fall back to Plan F's single-merge path. This keeps the dispatch
+    # safe for callers that do not yet know about chain mode.
+    if zfs::layer_chain_active && [ "$#" -ge 1 ]; then
+        template=$(zfs::_install_layer_chain "${cache_key}" "${layer_count}" "${unpriv}" "$@")
+    else
+        template=$(zfs::_install_template_from_layers "${cache_key}" "${layer_count}" "${unpriv}")
+    fi
     zfs::clone_container "${template}" "${name}"
 }
 
@@ -1292,7 +1302,13 @@ zfs::_pull_and_install_template() (
         unpriv=y
     fi
 
-    zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
+    if zfs::layer_chain_active; then
+        local -a layer_digests=()
+        readarray -t layer_digests < .layers
+        zfs::_install_layer_chain "${config}" "${layer_count}" "${unpriv}" "${layer_digests[@]}" > /dev/null
+    else
+        zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
+    fi
 
     printf "%s" "${config}"
 )

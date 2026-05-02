@@ -552,7 +552,13 @@ docker::load() (
     fi
 
     if zfs::enabled; then
-        zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
+        if zfs::layer_chain_active; then
+            local -a layer_digests=()
+            readarray -t layer_digests < .layers
+            zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}" "${layer_digests[@]}"
+        else
+            zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
+        fi
     else
         # Create a mount namespace and overlay mount
         mkdir -p rootfs "${name}"
