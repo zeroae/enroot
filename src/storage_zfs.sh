@@ -1017,3 +1017,68 @@ zfs::_pull_and_install_template() (
 
     printf "%s" "${config}"
 )
+
+# Internal helper used by both the daemon-import flow and the
+# create_from_pointer recovery path for dockerd:// / podman:// URIs. Runs
+# `${engine} create + inspect + export | tar -x`, populates the template
+# from the resulting flat rootfs, prints the resolved
+# image-config-sha256 (the daemon image ID) so the caller can validate
+# it. Does NOT write a pointer file.
+#
+# Inputs:
+#   $1 uri    - dockerd://<image>  or  podman://<image>
+#   $2 arch   - already debarch-normalized (callers must convert with
+#               common::debarch first, or pass the value already stored
+#               in a pointer file).
+#
+# Subshell function for cwd / EXIT trap scoping (matches
+# _pull_and_install_template).
+zfs::_extract_and_install_from_daemon() (
+    local -r uri="$1" arch="$2"
+    local image= tmpdir= engine= cache_key= unpriv=
+    local image_id=
+
+    set -euo pipefail
+
+    case "${uri}" in
+        dockerd://*) engine="docker" ;;
+        podman://*)  engine="podman" ;;
+        *)           common::err "_extract_and_install_from_daemon: not a daemon URI: ${uri}" ;;
+    esac
+
+    common::checkcmd jq "${engine}" tar
+
+    local -r reg_image="[[:alnum:]/._:-]+"
+    if [[ "${uri}" =~ ^[[:alpha:]]+://(${reg_image})$ ]]; then
+        image="${BASH_REMATCH[1]}"
+    else
+        common::err "Invalid image reference: ${uri}"
+    fi
+
+    image_id=$("${engine}" inspect --format '{{.Id}}' "${image}") \
+      || common::err "${engine} inspect ${image} failed"
+    [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "${engine} returned unexpected image ID: ${image_id}"
+    cache_key="${image_id#sha256:}"
+
+    trap 'common::rmall "${tmpdir}" 2> /dev/null; "${engine}" rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT
+    tmpdir=$(common::mktmpdir enroot)
+    common::chdir "${tmpdir}"
+
+    common::log INFO "Extracting image content from ${engine} daemon..." NL
+    "${engine}" create --name "${PWD##*/}" "${image}" >&2
+    mkdir rootfs
+    "${engine}" export "${PWD##*/}" \
+      | tar -C rootfs --warning=no-timestamp --anchored --exclude='dev/*' --exclude='.dockerenv' -px
+    common::fixperms rootfs
+    "${engine}" inspect "${image}" | common::jq '.[] | with_entries(.key|=ascii_downcase)' > config
+    docker::configure rootfs config "${arch}"
+
+    if [ "${EUID}" -ne 0 ]; then
+        unpriv=y
+    fi
+
+    zfs::_install_template_from_dir "${cache_key}" "${PWD}/rootfs" "${unpriv}" > /dev/null
+
+    printf "%s" "${cache_key}"
+)
