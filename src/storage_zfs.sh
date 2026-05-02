@@ -941,6 +941,181 @@ zfs::_install_template_from_dir() {
     printf "%s" "${template}"
 }
 
+# Builds one layer dataset on top of prev_layer (or as a base if prev_layer
+# is empty). Idempotent: if <store>/.layers/<digest>@done already exists, no
+# work is done. Race-safe via a per-digest .tmp dataset lock; losers wait
+# for @done. ENOSPC during apply triggers a single warm-template-eviction
+# retry, mirroring Plan B's pattern.
+#
+# Inputs:
+#   $1 digest      - the layer's content digest (cache key under .layers/)
+#   $2 prev_layer  - parent dataset name (empty for the base layer)
+#   $3 layer_dir   - extracted-layer directory in cwd (1, 2, ..., N from
+#                    docker::_prepare_layers' parallel extraction step)
+#   $4 unpriv      - "y" or "" — passed through to enroot-nsenter
+zfs::_build_layer() {
+    local -r digest="$1" prev_layer="$2" layer_dir="$3" unpriv="$4"
+    local store layer tmp snap mountpoint payload
+    local create_ok= i=0
+
+    store=$(zfs::store_dataset)
+    layer="${store}/${zfs_layers_subdir}/${digest}"
+    tmp="${layer}.tmp"
+    snap="${layer}@${zfs_layer_done_snap}"
+
+    # Cache hit: already built.
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        return
+    fi
+
+    # Try to win the lock. Base layers create-from-scratch; non-base layers
+    # clone the previous layer's @done. canmount=noauto avoids ZFS auto-mount
+    # (which would need CAP_SYS_ADMIN) — we mount via enroot-zfs-mount below.
+    if [ -z "${prev_layer}" ]; then
+        zfs create -u "${tmp}" 2> /dev/null && create_ok=y
+    else
+        zfs clone -o canmount=noauto "${prev_layer}@${zfs_layer_done_snap}" "${tmp}" 2> /dev/null && create_ok=y
+    fi
+
+    if [ -z "${create_ok}" ]; then
+        # Lost the race or stale .tmp. Wait briefly for another writer to
+        # finalize @done; on timeout, surface for manual cleanup.
+        while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
+            sleep 1
+            ((i++ < 600)) || common::err "Timed out waiting for layer ${digest:0:12} (stale ${tmp}?)"
+        done
+        return
+    fi
+
+    # Clones inherit readonly=on from the parent's snapshot; we need to write
+    # the layer's contents into the .tmp dataset before snapshotting, so flip
+    # it back off here. This is unprivileged-safe: 'zfs allow' includes the
+    # readonly property in the standard delegation set.
+    zfs set readonly=off "${tmp}" 2> /dev/null || :
+    if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+        zfs destroy "${tmp}" 2> /dev/null || :
+        common::err "failed to mount layer ${digest:0:12}"
+    fi
+    mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+    common::log INFO "Building layer ${digest:0:12}..."
+
+    payload=$(zfs::_apply_layer_payload "${PWD}/${layer_dir}" "${mountpoint}")
+    if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${payload}"; then
+        common::log WARN "Layer apply failed; evicting all warm templates and retrying"
+        ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+        enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${payload}" \
+          || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+               common::err "Failed to apply layer ${digest:0:12} even after evicting warm templates"; }
+    fi
+
+    enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
+    zfs rename "${tmp}" "${layer}"
+    enroot-zfs-mount "${layer}" 2> /dev/null || :
+    zfs snapshot "${snap}"
+    zfs set readonly=on "${layer}" 2> /dev/null || :
+    zfs set "enroot:layer-digest=${digest}" "${layer}" 2> /dev/null || :
+    zfs set "enroot:imported=$(date -u +%FT%TZ)" "${layer}" 2> /dev/null || :
+    enroot-zfs-mount --unmount "${layer}" 2> /dev/null || :
+}
+
+# Materializes the merged Docker rootfs into a ZFS template (cached by
+# cache_key) by building a per-layer clone chain under <store>/.layers/.
+# Drop-in replacement for _install_template_from_layers when chain mode
+# (ENROOT_ZFS_LAYER_CHAIN=y) is active. Designed to be called from
+# docker::load (or _pull_and_install_template) AFTER docker::_prepare_layers
+# has populated the cwd with extracted, whiteout-converted layer
+# directories 0/, 1/, ..., N/ and written the digest list to ./.layers.
+#
+# The leaf of the layer chain is cloned into <store>/.templates/<cache_key>
+# with @pristine snapshot, so the resulting template is shape-compatible
+# with Plan F templates: clone_container, the pointer-format flow, eviction
+# recovery, and zfs:// transport all work unchanged.
+#
+# Inputs:
+#   $1 cache_key   - sha256 of the image config blob
+#   $2 layer_count - the N from _prepare_layers
+#   $3 unpriv      - "y" or "" — passed through to enroot-nsenter
+#   $4..$(3+N)     - layer digests in stack order, base first, top last
+#
+# Outputs: prints the template dataset path on stdout (no trailing newline).
+#
+# Atomicity: per-layer races resolved via <digest>.tmp dataset locks
+# (see _build_layer); the final template is created via the same .tmp
+# pattern as Plan F's _install_template_from_layers, so concurrent
+# imports of the same image collapse onto one builder.
+zfs::_install_layer_chain() {
+    local -r cache_key="$1" layer_count="$2" unpriv="$3"
+    shift 3
+    local -a digests=("$@")
+    local store template tmp snap prev_layer leaf_layer
+    local i wait_i=0
+
+    if [ "${#digests[@]}" -ne "${layer_count}" ]; then
+        common::err "_install_layer_chain: digest count (${#digests[@]}) != layer_count (${layer_count})"
+    fi
+
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${cache_key}"
+    tmp="${template}.tmp"
+    snap="${template}@${zfs_pristine_snap}"
+
+    zfs::sweep_templates
+
+    # Ensure parent containers exist without auto-mounting them (mount(2)
+    # needs CAP_SYS_ADMIN; the helper below applies it via the +caps file
+    # capability).
+    zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    zfs create -u "${store}/${zfs_layers_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_layers_subdir}" 2> /dev/null || :
+
+    # Fast path: template already cached — nothing to do.
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        common::log INFO "Reusing cached template ${cache_key:0:12}"
+        zfs::touch_template "${template}"
+        printf "%s" "${template}"
+        return
+    fi
+
+    # Build the chain bottom-up. _build_layer is idempotent on cache hit,
+    # so a partial earlier chain (e.g. base layers reused from another
+    # image) costs only the missing top layers.
+    prev_layer=""
+    for ((i=0; i<layer_count; i++)); do
+        zfs::_build_layer "${digests[i]}" "${prev_layer}" "$((i+1))" "${unpriv}"
+        prev_layer="${store}/${zfs_layers_subdir}/${digests[i]}"
+    done
+    leaf_layer="${prev_layer}"
+
+    # Final: clone the leaf as the user-visible template. canmount=noauto
+    # so we control mount via the helper. Same .tmp-then-rename race
+    # protection as Plan F's _install_template_from_layers.
+    if zfs clone -o canmount=noauto "${leaf_layer}@${zfs_layer_done_snap}" "${tmp}" 2> /dev/null; then
+        # The clone needs no contents work — it's already the merged
+        # rootfs. Mount it just long enough to validate, then snapshot.
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy "${tmp}" 2> /dev/null || :
+            common::err "failed to mount template clone of layer leaf"
+        fi
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
+        zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
+        zfs snapshot "${snap}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
+        zfs::touch_template "${template}"
+    else
+        # Lost the race or stale .tmp — wait for @pristine.
+        while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
+            sleep 1
+            ((wait_i++ < 600)) || common::err "Timed out waiting for chain template: ${template}"
+        done
+    fi
+
+    printf "%s" "${template}"
+}
+
 # Import flow for docker:// URIs when the ZFS backend is active and the
 # pointer format is selected. Pulls layers (via docker::_prepare_layers),
 # fetches the manifest digest (via docker::digest), populates the
