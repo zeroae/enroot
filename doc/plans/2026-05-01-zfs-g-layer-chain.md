@@ -85,26 +85,32 @@ git commit -s -m "storage_zfs: add zfs::layer_chain_active predicate"
 
 ---
 
-### Task 2: Plumb layer digests out of `docker::_prepare_layers`
+### Task 2: Side-emit layer digests from `docker::_prepare_layers`
 
-Plan G needs the ordered list of registry layer content-digests as cache keys for `<store>/.layers/<digest>`. Today `_prepare_layers` only emits `config\nlayer_count\n` on stdout. Existing callers (Plan F's `_install_template_from_layers`, `docker::import`, `docker::load`'s dir branch) read exactly two lines via `common::read`; they must keep working unchanged.
+Plan G needs the ordered list of registry layer content-digests as cache keys for `<store>/.layers/<digest>`. Today `_prepare_layers` only emits `config\nlayer_count\n` on stdout. Existing callers (Plan F's `_install_template_from_layers`, `docker::import`, `docker::load`'s dir branch) read exactly two lines via `common::read` and must keep working unchanged.
 
-The least-invasive plumbing: a new function `docker::_load_layer_digests` that re-runs the *cheap* parts of `_download` (parse the manifest, list digests) without re-extracting. The layers are already cached at `${ENROOT_CACHE_PATH}/<digest>` from `_prepare_layers`'s pull, so we don't pay any registry roundtrip — the manifest is also already cached in the token dir. The chain installer calls this helper to get the ordered digest list.
+Adding extra stdout lines is risky: a 2-line consumer closes the pipe after its second `read`, causing SIGPIPE on the producer's third printf. Under `set -euo pipefail` in the producer subshell that surfaces as a non-zero exit, breaking existing callers.
 
-Alternative considered and rejected: extending `_prepare_layers` stdout with extra lines after the existing two. Existing callers consume the pipe with `{ common::read; common::read; }` which leaves trailing lines unread, triggering SIGPIPE on the producer's printf and a non-zero exit under `pipefail`. Adding a side-channel fd works but complicates calling conventions. A standalone helper that re-parses the cached manifest is simplest and contained.
+The simplest fix: have `_prepare_layers` write the digest list to a sidecar file `./.layers` in its own cwd. Every caller already runs `_prepare_layers` inside a fresh `common::mktmpdir enroot` directory and `common::chdir`s into it, so the sidecar lives inside the per-call temp dir and is cleaned up by the caller's existing EXIT trap. Plan G's chain-mode caller does `readarray -t digests < .layers` after `_prepare_layers` returns. Non-chain callers simply ignore the file.
 
 **Files:**
 - Modify: `src/docker.sh`
 
-- [ ] **Step 2.1: Add `docker::_load_layer_digests`**
+- [ ] **Step 2.1: Have `_prepare_layers` write `./.layers`**
 
-Append after `docker::_prepare_layers` in `src/docker.sh`. The helper takes the same five inputs (`user registry image tag arch`) and prints one digest per line, in stack order (base first, top last). Implementation reuses `docker::_download`'s manifest-parsing path or directly reads the cached manifest.
+In `docker::_prepare_layers`, after `_download` has populated `${layers[@]}` and before the existing `printf "%s\n%s\n"` final output, add:
+
+```bash
+printf "%s\n" "${layers[@]}" > .layers
+```
+
+The file is one digest per line in stack order (base first, top last). It sits in the caller's temp dir, gets removed when the temp dir is.
 
 - [ ] **Step 2.2: Commit**
 
 ```sh
 git add src/docker.sh
-git commit -s -m "docker: add _load_layer_digests helper for chain-mode callers"
+git commit -s -m "docker: side-emit layer digests to ./.layers in _prepare_layers"
 ```
 
 ---
@@ -256,13 +262,13 @@ zfs::docker_install_from_layers() {
 
 - [ ] **Step 5.2: Pass layer digests from `docker::load`**
 
-In `src/docker.sh` `docker::load`'s ZFS branch (the `if zfs::enabled` block currently calling `zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"`), prepend a digest-list capture under chain mode and append it to the call:
+In `src/docker.sh` `docker::load`'s ZFS branch (the `if zfs::enabled` block currently calling `zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"`), read the sidecar `./.layers` written by `_prepare_layers` and pass the digests through under chain mode:
 
 ```bash
 if zfs::enabled; then
     if zfs::layer_chain_active; then
         local layer_digests=()
-        readarray -t layer_digests < <(docker::_load_layer_digests "${user}" "${registry}" "${image}" "${tag}" "${arch}")
+        readarray -t layer_digests < .layers
         zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}" "${layer_digests[@]}"
     else
         zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
@@ -274,12 +280,12 @@ fi
 
 - [ ] **Step 5.3: Pass layer digests from `zfs::_pull_and_install_template`**
 
-In `src/storage_zfs.sh`, the puller already calls `zfs::_install_template_from_layers` directly (it bypasses `docker_install_from_layers` because it doesn't clone — only fills the cache for the pointer-import / eviction-recovery flow). Mirror the dispatch:
+In `src/storage_zfs.sh`, the puller already calls `zfs::_install_template_from_layers` directly (it bypasses `docker_install_from_layers` because it doesn't clone — only fills the cache for the pointer-import / eviction-recovery flow). It also runs `_prepare_layers` inside its own `common::mktmpdir`+`chdir` block, so the same `./.layers` sidecar is available. Mirror the dispatch:
 
 ```bash
 if zfs::layer_chain_active; then
     local layer_digests=()
-    readarray -t layer_digests < <(docker::_load_layer_digests "${user}" "${registry}" "${image}" "${tag}" "${arch}")
+    readarray -t layer_digests < .layers
     zfs::_install_layer_chain "${config}" "${layer_count}" "${unpriv}" "${layer_digests[@]}" > /dev/null
 else
     zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
