@@ -13,7 +13,7 @@ LIBDIR     = $(DESTDIR)$(libdir)/enroot
 SYSCONFDIR = $(DESTDIR)$(sysconfdir)/enroot
 DATADIR    = $(DESTDIR)$(datadir)/enroot
 
-VERSION       := 4.1.2.zfs.4
+VERSION       := 4.1.2.zfs.5
 PACKAGE       ?= enroot
 ARCH          ?= $(shell uname -m)
 DEBUG         ?=

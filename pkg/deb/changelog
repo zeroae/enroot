@@ -1,3 +1,27 @@
+#PACKAGE# (4.1.2.zfs.5-1) UNRELEASED; urgency=medium
+
+  * Extend the ZFS pointer cache to `dockerd://` and `podman://` URIs.
+    Daemon imports now produce the same pointer-file artifact as
+    `docker://` imports and populate the layer-keyed template cache
+    (keyed by the daemon-reported image ID); repeat imports hit the
+    cache and `enroot create` becomes O(zfs clone) for those URIs too.
+    Pointer schema gains an optional `manifest-digest` field (omitted
+    for daemon-local images, which have no registry manifest digest).
+
+  * Stash docker provenance as ZFS user properties on each template
+    (`enroot:uri`, `enroot:manifest-digest`, `enroot:arch`,
+    `enroot:imported`). Templates become self-describing — operators
+    can identify cached images via `zfs get` without the (transient)
+    pointer file. Properties replicate via `zfs send -p`.
+
+  * Unmount idle templates after install. `zfs clone <template>@pristine`
+    does not require the source to be mounted, so cached-but-unused
+    templates now sit at zero mountpoints. Only active container clones
+    (and the `.templates` / `.ephemeral` parents) remain visible in
+    `mount(8)` output.
+
+ -- #USERNAME# <#EMAIL#>  Fri, 01 May 2026 22:00:00 +0000
+
 #PACKAGE# (4.1.2.zfs.4-1) UNRELEASED; urgency=medium
 
   * Add ZFS pointer-format import (default on ZFS backend). `enroot

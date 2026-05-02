@@ -61,7 +61,9 @@ zfs::touch_template() {
 zfs::set_template_metadata() {
     local -r template="$1" uri="$2" manifest_digest="$3" arch="$4"
     zfs set "enroot:uri=${uri}" "${template}" 2> /dev/null || :
-    zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    if [ -n "${manifest_digest}" ]; then
+        zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    fi
     zfs set "enroot:arch=${arch}" "${template}" 2> /dev/null || :
 }
 
@@ -200,11 +202,13 @@ zfs::write_pointer() {
     # space, newline, etc.). The character classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "zfs::write_pointer: invalid image-config-sha256: ${config_sha}"
-    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    if [ -n "${manifest_digest}" ]; then
+        [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    fi
     [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
       || common::err "zfs::write_pointer: invalid arch: ${arch}"
-    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+    [[ "${uri}" =~ ^(docker|dockerd|podman)://[A-Za-z0-9._:/@+-]+$ ]] \
       || common::err "zfs::write_pointer: invalid uri: ${uri}"
 
     imported=$(date -u +%FT%TZ)
@@ -212,7 +216,10 @@ zfs::write_pointer() {
     {
         printf "%s\n" "${zfs_pointer_magic}"
         printf "image-config-sha256=%s\n" "${config_sha}"
-        printf "manifest-digest=%s\n" "${manifest_digest}"
+        # manifest-digest is optional — daemon-local images (dockerd:// /
+        # podman://) don't have a registry manifest digest. Omit the line
+        # entirely when empty so the field's absence is unambiguous.
+        [ -n "${manifest_digest}" ] && printf "manifest-digest=%s\n" "${manifest_digest}"
         printf "arch=%s\n" "${arch}"
         printf "uri=%s\n" "${uri}"
         printf "imported=%s\n" "${imported}"
@@ -250,11 +257,16 @@ zfs::read_pointer() {
     # free of shell metacharacters. The classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "Pointer ${path} missing/invalid image-config-sha256"
-    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || common::err "Pointer ${path} missing/invalid manifest-digest"
+    # manifest-digest is optional — daemon-local imports (dockerd:// /
+    # podman://) omit it because the daemon doesn't carry a registry
+    # manifest digest. Validate the format only when the field is present.
+    if [ -n "${manifest_digest}" ]; then
+        [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          || common::err "Pointer ${path} invalid manifest-digest"
+    fi
     [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid arch"
-    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+    [[ "${uri}" =~ ^(docker|dockerd|podman)://[A-Za-z0-9._:/@+-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid uri"
     [[ "${imported}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
       || common::err "Pointer ${path} missing/invalid imported timestamp"
@@ -799,6 +811,72 @@ zfs::docker_install_from_layers() {
     zfs::clone_container "${template}" "${name}"
 }
 
+# Materializes a flat rootfs directory tree into a ZFS template (cached
+# by cache_key). Counterpart of _install_template_from_layers for callers
+# that already have a single rootfs/ tree (e.g. the dockerd:// / podman://
+# import path, where `${engine} export | tar -x` produces a flat tree, not
+# layered overlayfs directories).
+#
+# Inputs:
+#   $1 cache_key   - sha256 of the image config (the daemon image ID)
+#   $2 source_dir  - directory containing the rootfs to install
+#   $3 unpriv      - "y" or "" — whether to enter a new user namespace
+#
+# Outputs: prints the template dataset path to stdout (no trailing newline).
+#
+# Atomicity: races on the same cache_key are resolved via a per-key .tmp
+# dataset lock; losers wait for @pristine. Same shape as
+# _install_template_from_layers.
+zfs::_install_template_from_dir() {
+    local -r cache_key="$1" source_dir="$2" unpriv="$3"
+    local store template tmp snap mountpoint i=0
+    store=$(zfs::store_dataset)
+    template="${store}/${zfs_template_subdir}/${cache_key}"
+    tmp="${template}.tmp"
+    snap="${template}@${zfs_pristine_snap}"
+
+    zfs::sweep_templates
+
+    zfs create -u "${store}/${zfs_template_subdir}" 2> /dev/null || :
+    enroot-zfs-mount "${store}/${zfs_template_subdir}" 2> /dev/null || :
+
+    if zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; then
+        common::log INFO "Reusing cached template ${cache_key:0:12}"
+        zfs::touch_template "${template}"
+    elif zfs create -u "${tmp}" 2> /dev/null; then
+        if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
+            zfs destroy "${tmp}" 2> /dev/null || :
+            common::err "failed to mount daemon template"
+        fi
+        mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+        local copy_cmd
+        copy_cmd="tar --numeric-owner -C '${source_dir}/' --mode=u-s,g-s -cpf - . | tar --numeric-owner -C '${mountpoint}/' -xpf -"
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${copy_cmd}"; then
+            common::log WARN "Daemon template copy failed; evicting all warm templates and retrying"
+            ENROOT_TEMPLATE_WARM_SECONDS=0 zfs::sweep_templates
+            enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${copy_cmd}" \
+              || { zfs destroy -r "${tmp}" 2> /dev/null || :; \
+                   common::err "Failed to copy daemon rootfs into ZFS template even after evicting warm templates"; }
+        fi
+        enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
+        zfs rename "${tmp}" "${template}"
+        enroot-zfs-mount "${template}" 2> /dev/null || :
+        zfs snapshot "${snap}"
+        zfs set readonly=on "${template}" 2> /dev/null || :
+        zfs set "enroot:imported=$(date -u +%FT%TZ)" "${template}" 2> /dev/null || :
+        enroot-zfs-mount --unmount "${template}" 2> /dev/null || :
+        zfs::touch_template "${template}"
+    else
+        # Lost the race or stale .tmp — wait for @pristine.
+        while ! zfs list -H -t snapshot "${snap}" > /dev/null 2>&1; do
+            sleep 1
+            ((i++ < 600)) || common::err "Timed out waiting for daemon template: ${template}"
+        done
+    fi
+
+    printf "%s" "${template}"
+}
+
 # Import flow for docker:// URIs when the ZFS backend is active and the
 # pointer format is selected. Pulls layers (via docker::_prepare_layers),
 # fetches the manifest digest (via docker::digest), populates the
@@ -848,6 +926,39 @@ zfs::import_docker_pointer() (
     zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
 )
 
+# Import flow for dockerd:// / podman:// URIs when the ZFS backend is
+# active and the pointer format is selected. Modeled on
+# import_docker_pointer but uses the daemon-extract path
+# (_extract_and_install_from_daemon). manifest-digest is empty —
+# daemon-local images don't have a registry manifest digest, and the
+# pointer schema (Task 1) makes it optional.
+#
+# Inputs:
+#   $1 uri          - dockerd://<image>  or  podman://<image>
+#   $2 output_path  - where to write the pointer (caller pre-validated)
+#   $3 arch         - raw uname -m form; normalized internally via
+#                     common::debarch.
+zfs::import_daemon_pointer() (
+    local -r uri="$1" output_path="$2"
+    local arch="$3"
+    local cache_key=
+
+    set -euo pipefail
+
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
+
+    cache_key=$(zfs::_extract_and_install_from_daemon "${uri}" "${arch}")
+
+    local store
+    store=$(zfs::store_dataset)
+    zfs::set_template_metadata "${store}/${zfs_template_subdir}/${cache_key}" \
+        "${uri}" "" "${arch}"
+
+    zfs::write_pointer "${output_path}" "${cache_key}" "" "${arch}" "${uri}"
+)
+
 # Create flow for a ZFS pointer file. Reads the pointer, then either:
 # (a) clones an already-cached template on hit, or
 # (b) re-pulls from the pointer's URI to repopulate an evicted template,
@@ -889,7 +1000,14 @@ zfs::create_from_pointer() (
     # The pointer's `arch` is already debian-normalized (write_pointer
     # was given the normalized form), so pass it straight through to the
     # puller, which expects normalized.
-    fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+    case "${uri}" in
+        docker://*)
+            fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}") ;;
+        dockerd://*|podman://*)
+            fresh_config_sha=$(zfs::_extract_and_install_from_daemon "${uri}" "${arch}") ;;
+        *)
+            common::err "Pointer ${pointer_path} has unsupported URI scheme: ${uri}" ;;
+    esac
     if [ "${fresh_config_sha}" != "${image_config_sha256}" ]; then
         common::err "Pointer ${pointer_path} references image-config-sha256 ${image_config_sha256:0:12}, but ${uri} now resolves to ${fresh_config_sha:0:12}. Delete and re-import."
     fi
@@ -938,4 +1056,69 @@ zfs::_pull_and_install_template() (
     zfs::_install_template_from_layers "${config}" "${layer_count}" "${unpriv}" > /dev/null
 
     printf "%s" "${config}"
+)
+
+# Internal helper used by both the daemon-import flow and the
+# create_from_pointer recovery path for dockerd:// / podman:// URIs. Runs
+# `${engine} create + inspect + export | tar -x`, populates the template
+# from the resulting flat rootfs, prints the resolved
+# image-config-sha256 (the daemon image ID) so the caller can validate
+# it. Does NOT write a pointer file.
+#
+# Inputs:
+#   $1 uri    - dockerd://<image>  or  podman://<image>
+#   $2 arch   - already debarch-normalized (callers must convert with
+#               common::debarch first, or pass the value already stored
+#               in a pointer file).
+#
+# Subshell function for cwd / EXIT trap scoping (matches
+# _pull_and_install_template).
+zfs::_extract_and_install_from_daemon() (
+    local -r uri="$1" arch="$2"
+    local image= tmpdir= engine= cache_key= unpriv=
+    local image_id=
+
+    set -euo pipefail
+
+    case "${uri}" in
+        dockerd://*) engine="docker" ;;
+        podman://*)  engine="podman" ;;
+        *)           common::err "_extract_and_install_from_daemon: not a daemon URI: ${uri}" ;;
+    esac
+
+    common::checkcmd jq "${engine}" tar
+
+    local -r reg_image="[[:alnum:]/._:-]+"
+    if [[ "${uri}" =~ ^[[:alpha:]]+://(${reg_image})$ ]]; then
+        image="${BASH_REMATCH[1]}"
+    else
+        common::err "Invalid image reference: ${uri}"
+    fi
+
+    image_id=$("${engine}" inspect --format '{{.Id}}' "${image}") \
+      || common::err "${engine} inspect ${image} failed"
+    [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || common::err "${engine} returned unexpected image ID: ${image_id}"
+    cache_key="${image_id#sha256:}"
+
+    trap 'common::rmall "${tmpdir}" 2> /dev/null; "${engine}" rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT
+    tmpdir=$(common::mktmpdir enroot)
+    common::chdir "${tmpdir}"
+
+    common::log INFO "Extracting image content from ${engine} daemon..." NL
+    "${engine}" create --name "${PWD##*/}" "${image}" >&2
+    mkdir rootfs
+    "${engine}" export "${PWD##*/}" \
+      | tar -C rootfs --warning=no-timestamp --anchored --exclude='dev/*' --exclude='.dockerenv' -px
+    common::fixperms rootfs
+    "${engine}" inspect "${image}" | common::jq '.[] | with_entries(.key|=ascii_downcase)' > config
+    docker::configure rootfs config "${arch}"
+
+    if [ "${EUID}" -ne 0 ]; then
+        unpriv=y
+    fi
+
+    zfs::_install_template_from_dir "${cache_key}" "${PWD}/rootfs" "${unpriv}" > /dev/null
+
+    printf "%s" "${cache_key}"
 )
