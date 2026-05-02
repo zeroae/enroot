@@ -587,7 +587,31 @@ runtime::import() {
         fi
         ;;
     dockerd://* | podman://*)
-        docker::daemon::import "${uri}" "${filename}" "${arch}" ;;
+        if zfs::pointer_format_active; then
+            # ZFS pointer-format daemon import: write a small magic-prefixed
+            # pointer file alongside populating the template cache.
+            # Filename defaulting mirrors docker::daemon::import — daemon URIs
+            # have a `<scheme>://<image-ref>` shape; default filename slugs
+            # the image ref into a .sqsh path.
+            if [ -z "${filename}" ]; then
+                local _image=
+                local -r _reg_image="[[:alnum:]/._:-]+"
+                if [[ "${uri}" =~ ^[[:alpha:]]+://(${_reg_image})$ ]]; then
+                    _image="${BASH_REMATCH[1]}"
+                else
+                    common::err "Invalid image reference: ${uri}"
+                fi
+                filename="${_image//[:\/]/+}.sqsh"
+            fi
+            filename=$(common::realpath "${filename}")
+            if [ -e "${filename}" ]; then
+                common::err "File already exists: ${filename}"
+            fi
+            zfs::import_daemon_pointer "${uri}" "${filename}" "${arch}"
+        else
+            docker::daemon::import "${uri}" "${filename}" "${arch}"
+        fi
+        ;;
     zfs://*)
         zfs::import_uri "${uri}" "${filename}" ;;
     *)
