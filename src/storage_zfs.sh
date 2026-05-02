@@ -762,13 +762,16 @@ cd '@@LAYER@@'
 # Phase 1: opaque-dir clearing. trusted.overlay.opaque=y on a layer dir
 # means "ignore everything from the parent in this dir"; we replicate
 # that by clearing the corresponding target dir's children before
-# layering this layer's contents on top.
-getfattr -R -h --absolute-names -n trusted.overlay.opaque . 2>/dev/null \
-  | awk -F': ' 'sub(/^# file: /, "")' \
+# layering this layer's contents on top. getfattr exits non-zero when no
+# matches are found, so the result is captured to a temp file with
+# || true to keep set -e + pipefail happy.
+getfattr -R -h --absolute-names -n trusted.overlay.opaque . 2>/dev/null > /tmp/.enroot-opq.$$ || true
+awk -F': ' 'sub(/^# file: /, "")' /tmp/.enroot-opq.$$ \
   | while IFS= read -r d; do
         rel="${d#./}"
         find '@@TARGET@@/'"${rel}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || :
     done
+rm -f /tmp/.enroot-opq.$$
 
 # Phase 2: whiteout deletion. Each char-device 0:0 in the layer encodes
 # "this path is removed in this layer". Be defensive — only treat 0:0
@@ -780,14 +783,17 @@ find . -type c | while IFS= read -r wh; do
 done
 
 # Phase 3: tar-pipe non-whiteout contents into the target. xattrs
-# (overlayfs opaque markers, capability bits, SELinux labels) and ACLs
-# are preserved. Char devices are excluded — both the 0:0 whiteouts we
+# (overlayfs opaque markers, capability bits, SELinux labels) are
+# preserved. Char devices are excluded — both the 0:0 whiteouts we
 # already actioned in phase 2 and any other char devs (which would not
-# be expected in Docker images post extraction).
+# be expected in Docker images post extraction). POSIX ACLs are not
+# preserved because (a) ZFS datasets default to acltype=off which
+# makes `tar --acls` fail with noisy warnings even when the source has
+# no ACLs, and (b) Docker images effectively never depend on ACLs.
 find . -type c -printf '%P\n' > /tmp/.enroot-excludes.$$
 tar -C . --exclude-from=/tmp/.enroot-excludes.$$ \
-    --xattrs --xattrs-include='*' --acls -cpf - . \
-  | tar -C '@@TARGET@@' --xattrs --xattrs-include='*' --acls -xpf -
+    --xattrs --xattrs-include='*' -cpf - . \
+  | tar -C '@@TARGET@@' --xattrs --xattrs-include='*' -xpf -
 rm -f /tmp/.enroot-excludes.$$
 PAYLOAD
 }
@@ -1036,16 +1042,28 @@ zfs::_build_layer() {
 # has populated the cwd with extracted, whiteout-converted layer
 # directories 0/, 1/, ..., N/ and written the digest list to ./.layers.
 #
-# The leaf of the layer chain is cloned into <store>/.templates/<cache_key>
-# with @pristine snapshot, so the resulting template is shape-compatible
-# with Plan F templates: clone_container, the pointer-format flow, eviction
-# recovery, and zfs:// transport all work unchanged.
+# The leaf of the layer chain is cloned into <store>/.templates/<cache_key>,
+# the per-image synthetic config layer 0/ (rc/fstab/environment generated
+# by docker::configure) is applied on top, and the result is snapshotted
+# as @pristine. The template is therefore shape-compatible with Plan F
+# templates: clone_container, the pointer-format flow, eviction recovery,
+# and zfs:// transport all work unchanged.
+#
+# Layer ordering: docker::_download reverses the registry's manifest order,
+# so digests[0] is the TOP layer (e.g. node binary) and digests[N-1] is
+# the BASE layer (e.g. alpine root). docker::_prepare_layers' parallel
+# extraction puts each digest into directory `i+1` (1-based), so dir 1 =
+# digests[0] = TOP and dir N = digests[N-1] = BASE. We build the chain
+# BASE-first (iterating i=N-1 down to 0) so the leaf @done snapshot
+# contains the fully merged rootfs and matches Plan F's overlay-mount
+# output (lowerdir=0:1:2:...:N stacks 0 on top of 1 on top of 2 ...).
 #
 # Inputs:
 #   $1 cache_key   - sha256 of the image config blob
 #   $2 layer_count - the N from _prepare_layers
 #   $3 unpriv      - "y" or "" — passed through to enroot-nsenter
-#   $4..$(3+N)     - layer digests in stack order, base first, top last
+#   $4..$(3+N)     - layer digests with docker::_download's reversed
+#                    convention: digests[0] = TOP, digests[N-1] = BASE
 #
 # Outputs: prints the template dataset path on stdout (no trailing newline).
 #
@@ -1087,26 +1105,42 @@ zfs::_install_layer_chain() {
         return
     fi
 
-    # Build the chain bottom-up. _build_layer is idempotent on cache hit,
-    # so a partial earlier chain (e.g. base layers reused from another
-    # image) costs only the missing top layers.
+    # Build the chain BASE-first (iterate from digests[N-1] = BASE to
+    # digests[0] = TOP). _build_layer is idempotent on @done cache hit,
+    # so re-pulling an image whose lower layers are already cached costs
+    # only the new top layers.
     prev_layer=""
-    for ((i=0; i<layer_count; i++)); do
+    for ((i=layer_count-1; i>=0; i--)); do
         zfs::_build_layer "${digests[i]}" "${prev_layer}" "$((i+1))" "${unpriv}"
         prev_layer="${store}/${zfs_layers_subdir}/${digests[i]}"
     done
     leaf_layer="${prev_layer}"
 
-    # Final: clone the leaf as the user-visible template. canmount=noauto
-    # so we control mount via the helper. Same .tmp-then-rename race
-    # protection as Plan F's _install_template_from_layers.
+    # Final: clone the leaf as the user-visible template, then apply the
+    # per-image synthetic config layer 0/ on top. canmount=noauto so we
+    # control mount via the helper. Same .tmp-then-rename race protection
+    # as Plan F's _install_template_from_layers.
     if zfs clone -o canmount=noauto "${leaf_layer}@${zfs_layer_done_snap}" "${tmp}" 2> /dev/null; then
-        # The clone needs no contents work — it's already the merged
-        # rootfs. Mount it just long enough to validate, then snapshot.
+        zfs set readonly=off "${tmp}" 2> /dev/null || :
         if ! enroot-zfs-mount "${tmp}" 2> /dev/null; then
             zfs destroy "${tmp}" 2> /dev/null || :
             common::err "failed to mount template clone of layer leaf"
         fi
+        local tmp_mountpoint
+        tmp_mountpoint=$(zfs get -H -o value mountpoint "${tmp}")
+
+        # Apply the synthetic config layer (dir 0/, populated by
+        # docker::configure with /etc/{rc,fstab,environment} derived from
+        # the image config). It has no whiteouts, so the apply payload
+        # degenerates to a tar-pipe — but reusing the same payload keeps
+        # xattr-handling consistent with the registry layers.
+        local config_payload
+        config_payload=$(zfs::_apply_layer_payload "${PWD}/0" "${tmp_mountpoint}")
+        if ! enroot-nsenter ${unpriv:+--user} --mount --remap-root bash -c "${config_payload}"; then
+            zfs destroy -r "${tmp}" 2> /dev/null || :
+            common::err "Failed to apply synthetic config layer to template ${cache_key:0:12}"
+        fi
+
         enroot-zfs-mount --unmount "${tmp}" 2> /dev/null || :
         zfs rename "${tmp}" "${template}"
         enroot-zfs-mount "${template}" 2> /dev/null || :
