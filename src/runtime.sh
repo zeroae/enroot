@@ -302,6 +302,13 @@ runtime::start() {
         if [[ "${rootfs}" == */* ]]; then
             common::err "Invalid argument: ${rootfs}"
         fi
+        # ZFS containers are created with canmount=noauto, so a freshly-
+        # rebooted host has the dataset present but unmounted. Mount it
+        # idempotently before the directory existence check below — the
+        # cap helper silently no-ops on already-mounted datasets.
+        if zfs::enabled; then
+            zfs::ensure_container_mounted "${rootfs}"
+        fi
         rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs}")
         if [ ! -d "${rootfs}" ]; then
             common::err "No such file or directory: ${rootfs}"
@@ -688,6 +695,13 @@ runtime::_export_sqsh() {
     local rootfs exclude=()
 
     common::checkcmd mksquashfs
+
+    # ZFS containers may be unmounted post-reboot (canmount=noauto + no
+    # boot-time auto-mount); ensure the dataset is mounted before
+    # mksquashfs walks the rootfs path.
+    if zfs::enabled; then
+        zfs::ensure_container_mounted "${rootfs_name}"
+    fi
 
     # Resolve the container rootfs path.
     rootfs=$(common::realpath "${ENROOT_DATA_PATH}/${rootfs_name}")
