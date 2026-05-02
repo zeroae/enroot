@@ -1000,7 +1000,14 @@ zfs::create_from_pointer() (
     # The pointer's `arch` is already debian-normalized (write_pointer
     # was given the normalized form), so pass it straight through to the
     # puller, which expects normalized.
-    fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}")
+    case "${uri}" in
+        docker://*)
+            fresh_config_sha=$(zfs::_pull_and_install_template "${uri}" "${arch}") ;;
+        dockerd://*|podman://*)
+            fresh_config_sha=$(zfs::_extract_and_install_from_daemon "${uri}" "${arch}") ;;
+        *)
+            common::err "Pointer ${pointer_path} has unsupported URI scheme: ${uri}" ;;
+    esac
     if [ "${fresh_config_sha}" != "${image_config_sha256}" ]; then
         common::err "Pointer ${pointer_path} references image-config-sha256 ${image_config_sha256:0:12}, but ${uri} now resolves to ${fresh_config_sha:0:12}. Delete and re-import."
     fi
