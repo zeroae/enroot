@@ -87,6 +87,12 @@ imported=2026-04-29T18:23:11Z
 Pyxis treats the file as opaque (writes to a per-uid runtime dir, deletes it
 after `enroot create`), so the format change is invisible to pyxis.
 
+### Daemon URIs (`dockerd://`, `podman://`)
+
+`enroot import dockerd://<image>` and `enroot import podman://<image>` participate in the same pointer cache. The cache key is the daemon-reported image ID (`${engine} inspect --format='{{.Id}}'`), which matches the `image-config-sha256` of a `docker://`-pulled equivalent for registry-pulled images — so a daemon import of `ubuntu:24.04` shares the cache with a registry import of the same reference for free.
+
+Daemon-local images don't have a registry manifest digest, so the pointer file's `manifest-digest=` line is omitted. The `enroot:manifest-digest` user property is also unset on the corresponding template. All other fields (`enroot:uri`, `enroot:arch`, `enroot:imported`) are populated normally; the inspection one-liner above shows daemon-sourced templates with `enroot:uri=dockerd://...`.
+
 ### Opting out
 
 Set `ENROOT_ZFS_IMPORT_FORMAT=squashfs` in the environment or the config
