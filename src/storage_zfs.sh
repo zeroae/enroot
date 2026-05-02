@@ -926,6 +926,39 @@ zfs::import_docker_pointer() (
     zfs::write_pointer "${output_path}" "${config_sha}" "${manifest_digest}" "${arch}" "${uri}"
 )
 
+# Import flow for dockerd:// / podman:// URIs when the ZFS backend is
+# active and the pointer format is selected. Modeled on
+# import_docker_pointer but uses the daemon-extract path
+# (_extract_and_install_from_daemon). manifest-digest is empty —
+# daemon-local images don't have a registry manifest digest, and the
+# pointer schema (Task 1) makes it optional.
+#
+# Inputs:
+#   $1 uri          - dockerd://<image>  or  podman://<image>
+#   $2 output_path  - where to write the pointer (caller pre-validated)
+#   $3 arch         - raw uname -m form; normalized internally via
+#                     common::debarch.
+zfs::import_daemon_pointer() (
+    local -r uri="$1" output_path="$2"
+    local arch="$3"
+    local cache_key=
+
+    set -euo pipefail
+
+    if [ -n "${arch}" ]; then
+        arch=$(common::debarch "${arch}")
+    fi
+
+    cache_key=$(zfs::_extract_and_install_from_daemon "${uri}" "${arch}")
+
+    local store
+    store=$(zfs::store_dataset)
+    zfs::set_template_metadata "${store}/${zfs_template_subdir}/${cache_key}" \
+        "${uri}" "" "${arch}"
+
+    zfs::write_pointer "${output_path}" "${cache_key}" "" "${arch}" "${uri}"
+)
+
 # Create flow for a ZFS pointer file. Reads the pointer, then either:
 # (a) clones an already-cached template on hit, or
 # (b) re-pulls from the pointer's URI to repopulate an evicted template,
