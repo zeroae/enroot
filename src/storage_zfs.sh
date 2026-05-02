@@ -61,7 +61,9 @@ zfs::touch_template() {
 zfs::set_template_metadata() {
     local -r template="$1" uri="$2" manifest_digest="$3" arch="$4"
     zfs set "enroot:uri=${uri}" "${template}" 2> /dev/null || :
-    zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    if [ -n "${manifest_digest}" ]; then
+        zfs set "enroot:manifest-digest=${manifest_digest}" "${template}" 2> /dev/null || :
+    fi
     zfs set "enroot:arch=${arch}" "${template}" 2> /dev/null || :
 }
 
@@ -200,11 +202,13 @@ zfs::write_pointer() {
     # space, newline, etc.). The character classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "zfs::write_pointer: invalid image-config-sha256: ${config_sha}"
-    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    if [ -n "${manifest_digest}" ]; then
+        [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          || common::err "zfs::write_pointer: invalid manifest-digest: ${manifest_digest}"
+    fi
     [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
       || common::err "zfs::write_pointer: invalid arch: ${arch}"
-    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+    [[ "${uri}" =~ ^(docker|dockerd|podman)://[A-Za-z0-9._:/@+-]+$ ]] \
       || common::err "zfs::write_pointer: invalid uri: ${uri}"
 
     imported=$(date -u +%FT%TZ)
@@ -212,7 +216,10 @@ zfs::write_pointer() {
     {
         printf "%s\n" "${zfs_pointer_magic}"
         printf "image-config-sha256=%s\n" "${config_sha}"
-        printf "manifest-digest=%s\n" "${manifest_digest}"
+        # manifest-digest is optional — daemon-local images (dockerd:// /
+        # podman://) don't have a registry manifest digest. Omit the line
+        # entirely when empty so the field's absence is unambiguous.
+        [ -n "${manifest_digest}" ] && printf "manifest-digest=%s\n" "${manifest_digest}"
         printf "arch=%s\n" "${arch}"
         printf "uri=%s\n" "${uri}"
         printf "imported=%s\n" "${imported}"
@@ -250,11 +257,16 @@ zfs::read_pointer() {
     # free of shell metacharacters. The classes below all forbid them.
     [[ "${config_sha}" =~ ^[0-9a-f]{64}$ ]] \
       || common::err "Pointer ${path} missing/invalid image-config-sha256"
-    [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || common::err "Pointer ${path} missing/invalid manifest-digest"
+    # manifest-digest is optional — daemon-local imports (dockerd:// /
+    # podman://) omit it because the daemon doesn't carry a registry
+    # manifest digest. Validate the format only when the field is present.
+    if [ -n "${manifest_digest}" ]; then
+        [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          || common::err "Pointer ${path} invalid manifest-digest"
+    fi
     [[ "${arch}" =~ ^[a-z0-9_-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid arch"
-    [[ "${uri}" =~ ^docker://[A-Za-z0-9._:/@+-]+$ ]] \
+    [[ "${uri}" =~ ^(docker|dockerd|podman)://[A-Za-z0-9._:/@+-]+$ ]] \
       || common::err "Pointer ${path} missing/invalid uri"
     [[ "${imported}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
       || common::err "Pointer ${path} missing/invalid imported timestamp"
