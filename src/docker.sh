@@ -326,6 +326,13 @@ docker::_prepare_layers() (
     zstd -q -d -o config "${ENROOT_CACHE_PATH}/${config}"
     docker::configure "${PWD}/0" config "${arch}"
 
+    # Side-emit the ordered layer-digest list to ./.layers (one per line, base
+    # first, top last). The ZFS chain-mode path (Plan G) reads this back to
+    # build the per-layer dataset chain. Plan F and dir-backend callers ignore
+    # the file; it lives in the caller's per-call mktmpdir so it gets cleaned
+    # up alongside the rest of the extraction temp dir.
+    printf "%s\n" "${layers[@]}" > .layers
+
     printf "%s\n%s\n" "${config}" "${#layers[@]}"
 )
 
@@ -545,7 +552,13 @@ docker::load() (
     fi
 
     if zfs::enabled; then
-        zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
+        if zfs::layer_chain_active; then
+            local -a layer_digests=()
+            readarray -t layer_digests < .layers
+            zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}" "${layer_digests[@]}"
+        else
+            zfs::docker_install_from_layers "${config}" "${layer_count}" "${unpriv}" "${name}"
+        fi
     else
         # Create a mount namespace and overlay mount
         mkdir -p rootfs "${name}"

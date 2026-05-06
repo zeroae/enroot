@@ -1,6 +1,6 @@
 # ZFS storage backend
 
-This document describes an optional ZFS-aware mode for the enroot container store. **All six plans (A–F) are implemented.** When `ENROOT_STORAGE_BACKEND=zfs`: `enroot create`, `enroot remove`, ephemeral `enroot start <image>`, and `enroot load docker://...` all use ZFS datasets, with a shared template cache that survives `enroot remove` (warm) for `ENROOT_TEMPLATE_WARM_SECONDS` and gets pressure-evicted LRU once the templates dataset crosses `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` of its quota. `enroot create` accepts both `.sqsh` and `.zfs` (zfs send stream) inputs; `enroot export --format=zfs` produces the latter. The `zfs://[USER@]HOST/NAME` URI scheme transports containers between enroot hosts over SSH (`enroot load zfs://...` to pull, `enroot export NAME zfs://...` to push). The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
+This document describes an optional ZFS-aware mode for the enroot container store. **All six plans (A–F) are implemented; Plan G adds an opt-in per-layer clone chain on top of F.** When `ENROOT_STORAGE_BACKEND=zfs`: `enroot create`, `enroot remove`, ephemeral `enroot start <image>`, and `enroot load docker://...` all use ZFS datasets, with a shared template cache that survives `enroot remove` (warm) for `ENROOT_TEMPLATE_WARM_SECONDS` and gets pressure-evicted LRU once the templates dataset crosses `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` of its quota. `enroot create` accepts both `.sqsh` and `.zfs` (zfs send stream) inputs; `enroot export --format=zfs` produces the latter. The `zfs://[USER@]HOST/NAME` URI scheme transports containers between enroot hosts over SSH (`enroot load zfs://...` to pull, `enroot export NAME zfs://...` to push). The default storage backend (plain directories under `ENROOT_DATA_PATH`) is unchanged and remains the only option on hosts without ZFS.
 
 ## Motivation
 
@@ -15,6 +15,7 @@ The ZFS backend is an *alternative storage driver*, in the same spirit as Docker
 | `ENROOT_STORAGE_BACKEND` | `dir` | `dir` = today's behavior. `zfs` = use ZFS datasets for the container store. |
 | `ENROOT_TEMPLATE_WARM_SECONDS` | `604800` (7 days) | How long a template with no clones remains evictable only under pressure. `0` = evict immediately when refcount reaches zero (refcount-only). `inf` = never auto-evict. |
 | `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` | `0.80` | Templates dataset quota fraction above which routine `create`s start evicting warm templates. Soft signal; the ZFS quota is the hard wall. |
+| `ENROOT_ZFS_LAYER_CHAIN` | unset | When `y` AND backend is `zfs`, populate the Docker template cache via a per-layer `zfs clone` chain under `<store>/.layers/<digest>` instead of a single merged extract. Cross-image base layers are physically shared on disk (a debian-bookworm base used by both `python:slim` and `node:slim` is stored once). Applies to `docker://` URIs only; `dockerd://` and `podman://` always go through the daemon-flat-export path and are unaffected. Default off — leaves Plan F's single-merge path unchanged. |
 
 When `ENROOT_STORAGE_BACKEND=zfs`, `ENROOT_DATA_PATH` must be the mountpoint of a ZFS dataset that the unprivileged user has been granted permission on (see [Admin setup](#admin-setup)).
 
@@ -25,6 +26,17 @@ ${pool}/${dataset}/templates/<sha256>            # one per distinct image conten
 ${pool}/${dataset}/templates/<sha256>@pristine   # snapshot taken after extraction
 ${pool}/${dataset}/<user>/<container_name>       # clones of @pristine, the user's containers
 ```
+
+When `ENROOT_ZFS_LAYER_CHAIN=y`, an additional `.layers/` namespace appears under the same store; templates become clones of the chain leaf instead of being filled by a single merged extract:
+
+```
+${pool}/${dataset}/.layers/<layer-digest>            # one per distinct registry layer
+${pool}/${dataset}/.layers/<layer-digest>@done       # snapshot taken after layer apply
+${pool}/${dataset}/.templates/<image-config-sha>     # zfs clone of the chain leaf @done
+${pool}/${dataset}/.templates/<image-config-sha>@pristine
+```
+
+Each layer dataset is `zfs clone`d from the previous layer's `@done`, so two images sharing a base layer (e.g. `python:3.12-slim` and `node:20-slim`, both built on `debian:bookworm-slim`) physically share the base bytes. Layer datasets are immutable origins; ZFS refuses to destroy a layer while any descendant clone exists, so layer GC is automatic once all referencing templates are evicted.
 
 Mountpoints follow the dataset hierarchy under `ENROOT_DATA_PATH`. Templates are not user-visible — `enroot list` only enumerates `<user>/<container_name>` clones. Templates have `readonly=on`; clones inherit the property override on `start -w`.
 
