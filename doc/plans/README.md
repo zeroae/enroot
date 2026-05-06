@@ -11,16 +11,15 @@ Plans for landing the optional ZFS storage backend designed in [`../zfs.md`](../
 | E. Ephemeral start ZFS path — substitute `squashfuse + overlay` with throwaway clone | [2026-04-29-zfs-e-ephemeral-start.md](2026-04-29-zfs-e-ephemeral-start.md) | A |
 | F. Docker layer-stack ZFS path — lift `ENROOT_NATIVE_OVERLAYFS=y` requirement on ZFS hosts | [2026-04-29-zfs-f-docker-load.md](2026-04-29-zfs-f-docker-load.md) | A |
 | G. Per-layer ZFS clone chain (opt-in `ENROOT_ZFS_LAYER_CHAIN=y`) — cross-image layer dedup at the dataset level | [2026-05-01-zfs-g-layer-chain.md](2026-05-01-zfs-g-layer-chain.md) | F |
-| H. Extend chain mode to `dockerd://` / `podman://` URIs via `${engine} save` | [2026-05-06-zfs-h-daemon-chain.md](2026-05-06-zfs-h-daemon-chain.md) | G |
 
 ```
 A ─┬─> B
    ├─> C ─> D
    ├─> E
-   └─> F ─> G ─> H
+   └─> F ─> G
 ```
 
-Recommended landing order: **A → E → F → B → C → D → G → H**. A is the foundation; E/F give the most user-visible wins next; B improves cache economics; C/D add transport options; G is an opt-in optimization on top of F; H extends G's reuse story to daemon-local images.
+Recommended landing order: **A → E → F → B → C → D → G**. A is the foundation; E/F give the most user-visible wins next; B improves cache economics; C/D add transport options; G is an opt-in optimization on top of F.
 
 ## Conventions used by these plans
 
