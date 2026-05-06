@@ -37,6 +37,8 @@ Each `.layers/<digest>` dataset's `@done` snapshot is reused on subsequent impor
 - `ENROOT_ZFS_LAYER_CHAIN=y`: dispatch to chain mode. Same dispatch is hit from `docker::load` and from `_pull_and_install_template` (the puller used by pointer-format import and eviction recovery), so all callers see chain-mode templates when the flag is on.
 - The fast path "template `@pristine` already exists, reuse it" is hit *before* the chain/no-chain dispatch. Templates produced under one mode are reused under the other without rebuild — only the *fill* mechanism differs on miss.
 
+**Scope: `docker://` URIs only.** Plan G applies to registry-pulled images that go through `docker::_prepare_layers` (which produces the per-layer directories Plan G chains over). Daemon-local URIs (`dockerd://`, `podman://`) are *silently unaffected* by `ENROOT_ZFS_LAYER_CHAIN=y` — they go through `zfs::_extract_and_install_from_daemon`, which uses `${engine} export | tar -x` to produce a single flat rootfs (the daemon has already merged the layers internally; `docker export` is a flatten operation, not a layer-preserving one). That path goes through `zfs::_install_template_from_dir` and stays untouched. Bringing chain mode to daemon URIs is feasible but requires switching from `docker export` to `docker save` (which writes a tar archive containing per-layer tarballs plus a `manifest.json` describing layer order) — see Out of scope below.
+
 **Depends on:** Plans A, B, F (template lifecycle, sweep, ENOSPC retry shape are reused).
 
 **Prerequisite host setup:** Same as Plan F. ZFS user delegation must include `clone`. `promote` is **not** required (Plan G doesn't promote). Whiteout/xattr work runs inside `enroot-nsenter --user --remap-root --mount`, same as Plan F's merge step.
@@ -407,6 +409,12 @@ gh pr create --repo zeroae/enroot --base zenroot/main --head feature/zfs-g-layer
 - Cross-host layer replication via `zfs send`.
 - Migration tooling between merged-template and per-layer-chain caches.
 - Automated layer-dataset GC (manual `zfs destroy` works today).
+- **Chain mode for `dockerd://` / `podman://` URIs.** Daemon-URI imports use `${engine} export | tar -x` which flattens the layered image into a single tarball before extraction — there is no per-layer directory structure for the chain installer to consume. Adding chain support here would require:
+  1. Switching the daemon path from `${engine} export` to `${engine} save` (which writes a tar archive containing one `<digest>/layer.tar` per layer plus a `manifest.json` describing the order).
+  2. Parsing `manifest.json` to recover the layer-digest list.
+  3. Extracting each layer tarball into a directory parallel to what `docker::_prepare_layers` produces, then dispatching to `_install_layer_chain`.
+  4. Constructing a synthetic `0/` from the daemon's image config (`${engine} inspect`'s output).
+  This is a real follow-up plan, not a one-line addition. It also slightly changes the daemon contract — `docker save` requires more disk (full image tar before extraction) than `docker export` (streamed). For now `ENROOT_ZFS_LAYER_CHAIN=y` is a documented no-op for daemon URIs.
 
 ## Execution Handoff
 

@@ -15,7 +15,7 @@ The ZFS backend is an *alternative storage driver*, in the same spirit as Docker
 | `ENROOT_STORAGE_BACKEND` | `dir` | `dir` = today's behavior. `zfs` = use ZFS datasets for the container store. |
 | `ENROOT_TEMPLATE_WARM_SECONDS` | `604800` (7 days) | How long a template with no clones remains evictable only under pressure. `0` = evict immediately when refcount reaches zero (refcount-only). `inf` = never auto-evict. |
 | `ENROOT_TEMPLATE_PRESSURE_THRESHOLD` | `0.80` | Templates dataset quota fraction above which routine `create`s start evicting warm templates. Soft signal; the ZFS quota is the hard wall. |
-| `ENROOT_ZFS_LAYER_CHAIN` | unset | When `y` AND backend is `zfs`, populate the Docker template cache via a per-layer `zfs clone` chain under `<store>/.layers/<digest>` instead of a single merged extract. Cross-image base layers are physically shared on disk (a debian-bookworm base used by both `python:slim` and `node:slim` is stored once). Default off — leaves Plan F's single-merge path unchanged. |
+| `ENROOT_ZFS_LAYER_CHAIN` | unset | When `y` AND backend is `zfs`, populate the Docker template cache via a per-layer `zfs clone` chain under `<store>/.layers/<digest>` instead of a single merged extract. Cross-image base layers are physically shared on disk (a debian-bookworm base used by both `python:slim` and `node:slim` is stored once). Applies to `docker://` URIs only; `dockerd://` and `podman://` always go through the daemon-flat-export path and are unaffected. Default off — leaves Plan F's single-merge path unchanged. |
 
 When `ENROOT_STORAGE_BACKEND=zfs`, `ENROOT_DATA_PATH` must be the mountpoint of a ZFS dataset that the unprivileged user has been granted permission on (see [Admin setup](#admin-setup)).
 
